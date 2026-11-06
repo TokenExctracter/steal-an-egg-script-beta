@@ -1,0 +1,1091 @@
+--[[
+═══════════════════════════════════════════════════════════════════
+    🥚  ChinaV4Egg  —  Ultimate Egg Steal Autofarm
+    Custom animated UI • Full autofarm • ESP • Server hop
+    Speed bypass • Anti-AFK • Auto-rejoin • No-clip
+    Paste into executor, hit execute, press RightShift to toggle UI
+═══════════════════════════════════════════════════════════════════
+]]
+
+-- ========== SERVICES ==========
+local Players            = game:GetService("Players")
+local LocalPlayer        = Players.LocalPlayer
+local Workspace          = game:GetService("Workspace")
+local RunService         = game:GetService("RunService")
+local TweenService       = game:GetService("TweenService")
+local UserInputService   = game:GetService("UserInputService")
+local VirtualUser        = game:GetService("VirtualUser")
+local TeleportService    = game:GetService("TeleportService")
+local HttpService        = game:GetService("HttpService")
+local CoreGui            = game:GetService("CoreGui")
+local Lighting           = game:GetService("Lighting")
+
+-- ========== CONFIG / STATE ==========
+local Config = {
+    AutoFarm      = false,   -- auto-collect spawned eggs
+    AutoSteal     = false,   -- auto-touch players to steal their eggs
+    AutoDeposit   = false,   -- auto-walk to deposit zone when full
+    AutoRejoin    = false,   -- rejoin on disconnect
+    AntiAFK       = true,    -- never get kicked for idle
+    SpeedEnabled  = false,   -- movement speed boost
+    Speed         = 80,      -- studs/sec
+    InfJump       = false,   -- infinite jump
+    EggESP        = false,   -- highlight all eggs
+    PlayerESP     = false,   -- highlight other players
+    NoClip        = false,   -- walk through walls
+    CollectRange  = 10,      -- egg pickup radius
+    StealRange    = 14,      -- player steal radius
+    FarmDelay     = 0.05,    -- between farm actions (s)
+    StealDelay    = 0.1,     -- between steal actions (s)
+    DepositDelay  = 2.0,     -- between deposit attempts (s)
+}
+
+local State = {
+    Loaded       = false,
+    UIVisible    = true,
+    EggCache     = {},
+    Highlights   = {},
+    LastFarm     = 0,
+    LastSteal    = 0,
+    LastDeposit  = 0,
+}
+
+-- ========== HELPERS ==========
+local function tween(obj, props, time, style, dir)
+    local info = TweenInfo.new(time or 0.25, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out)
+    local t = TweenService:Create(obj, info, props)
+    t:Play()
+    return t
+end
+
+local function waitForChildSafe(parent, name, timeout)
+    timeout = timeout or 5
+    local child = parent:FindFirstChild(name)
+    if child then return child end
+    local start = tick()
+    while not child and tick() - start < timeout do
+        task.wait(0.1)
+        child = parent:FindFirstChild(name)
+    end
+    return child
+end
+
+-- Find all egg objects in workspace (flexible: matches common naming patterns)
+local function getEggs()
+    local eggs = {}
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("BasePart") or obj:IsA("Model") then
+            local n = obj.Name:lower()
+            if n:match("egg") and not n:match("esp") and not n:match("highlight") then
+                -- skip if it's an ESP we created
+                if not obj:FindFirstChild("__CHINAESP") then
+                    table.insert(eggs, obj)
+                end
+            end
+        end
+    end
+    return eggs
+end
+
+-- Find deposit/sell zones (matches "deposit", "sell", "base", "spawn")
+local function getDepositZones()
+    local zones = {}
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            local n = obj.Name:lower()
+            if n:match("deposit") or n:match("sell") or n:match("zone") or n:match("base") then
+                table.insert(zones, obj)
+            end
+        end
+    end
+    return zones
+end
+
+-- Find closest target to LocalPlayer
+local function closestFrom(list)
+    local char = LocalPlayer.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return nil end
+    local root = char.HumanoidRootPart
+    local best, bestDist
+    for _, obj in ipairs(list) do
+        local part = obj:IsA("Model") and obj.PrimaryPart or (obj:IsA("BasePart") and obj or nil)
+        if not part and obj:IsA("Model") then
+            part = obj:FindFirstChildWhichIsA("BasePart")
+        end
+        if part then
+            local d = (root.Position - part.Position).Magnitude
+            if not bestDist or d < bestDist then
+                best, bestDist = obj, d
+            end
+        end
+    end
+    return best, bestDist
+end
+
+-- Get other living players (excluding self)
+local function getOtherPlayers()
+    local list = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart") and p.Character:FindFirstChild("Humanoid") and p.Character.Humanoid.Health > 0 then
+            table.insert(list, p)
+        end
+    end
+    return list
+end
+
+-- ========== MOVEMENT (BYPASS) ==========
+-- Use CFrame teleport in small increments + velocity spoof to bypass WalkSpeed checks
+local function walkTo(pos, speed)
+    local char = LocalPlayer.Character
+    if not char then return end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local hum  = char:FindFirstChild("Humanoid")
+    if not root or not hum then return end
+
+    local startPos = root.Position
+    local dist = (Vector3.new(pos.X, startPos.Y, pos.Z) - startPos).Magnitude
+    if dist < 1 then return end
+
+    local dir = (Vector3.new(pos.X, startPos.Y, pos.Z) - startPos).Unit
+    local step = (speed or Config.Speed) * (1/60)
+
+    -- Move in small chunks to dodge anticheat speed flags
+    local traveled = 0
+    while traveled < dist and State.Running do
+        local nextPos = root.Position + dir * math.min(step, dist - traveled)
+        root.CFrame = CFrame.new(nextPos, nextPos + dir)
+        -- spoof WalkSpeed so server-side checks see normal value
+        if hum.WalkSpeed ~= 16 then hum.WalkSpeed = 16 end
+        traveled = traveled + step
+        task.wait(1/60)
+    end
+end
+
+local function teleportTo(pos)
+    local char = LocalPlayer.Character
+    if not char then return end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+    root.CFrame = CFrame.new(pos)
+end
+
+-- ========== UI LIBRARY (CUSTOM, ANIMATED) ==========
+local UI = {}
+do
+    -- tear down any previous instance
+    local old = CoreGui:FindFirstChild("ChinaV4EggUI")
+    if old then old:Destroy() end
+
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "ChinaV4EggUI"
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    ScreenGui.IgnoreGuiInset = true
+    ScreenGui.DisplayOrder = 9999
+    -- try parent to CoreGui, fallback to PlayerGui
+    pcall(function() ScreenGui.Parent = CoreGui end)
+    if not ScreenGui.Parent then ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+
+    UI.Screen = ScreenGui
+
+    -- accent color
+    local ACCENT   = Color3.fromRGB(120, 200, 120)
+    local ACCENT2  = Color3.fromRGB(80, 160, 80)
+    local BG       = Color3.fromRGB(22, 24, 28)
+    local BG2      = Color3.fromRGB(30, 33, 38)
+    local TXT      = Color3.fromRGB(235, 240, 235)
+    local TXTDIM   = Color3.fromRGB(150, 155, 150)
+
+    -- ===== LOADING SCREEN =====
+    local Loader = Instance.new("Frame")
+    Loader.Size = UDim2.new(0, 280, 0, 140)
+    Loader.Position = UDim2.new(0.5, -140, 0.5, -70)
+    Loader.BackgroundColor3 = BG
+    Loader.BackgroundTransparency = 1
+    Loader.Parent = ScreenGui
+
+    local LoadTitle = Instance.new("TextLabel")
+    LoadTitle.Size = UDim2.new(1, 0, 0, 30)
+    LoadTitle.Position = UDim2.new(0, 0, 0, 20)
+    LoadTitle.BackgroundTransparency = 1
+    LoadTitle.Text = "ChinaV4Egg"
+    LoadTitle.Font = Enum.Font.GothamBold
+    LoadTitle.TextSize = 22
+    LoadTitle.TextColor3 = TXT
+    LoadTitle.TextTransparency = 1
+    LoadTitle.Parent = Loader
+
+    local LoadSub = Instance.new("TextLabel")
+    LoadSub.Size = UDim2.new(1, 0, 0, 16)
+    LoadSub.Position = UDim2.new(0, 0, 0, 52)
+    LoadSub.BackgroundTransparency = 1
+    LoadSub.Text = "Booting autofarm..."
+    LoadSub.Font = Enum.Font.Gotham
+    LoadSub.TextSize = 12
+    LoadSub.TextColor3 = TXTDIM
+    LoadSub.TextTransparency = 1
+    LoadSub.Parent = Loader
+
+    local Spinner = Instance.new("Frame")
+    Spinner.Size = UDim2.new(0, 24, 0, 24)
+    Spinner.Position = UDim2.new(0.5, -12, 0, 88)
+    Spinner.BackgroundColor3 = Color3.new(0,0,0)
+    Spinner.BackgroundTransparency = 1
+    Spinner.Parent = Loader
+
+    local SpinUIC = Instance.new("UICorner")
+    SpinUIC.CornerRadius = UDim.new(1, 0)
+    SpinUIC.Parent = Spinner
+
+    local SpinnerBorder = Instance.new("UIStroke")
+    SpinnerBorder.Color = ACCENT
+    SpinnerBorder.Thickness = 2
+    SpinnerBorder.Transparency = 0.3
+    SpinnerBorder.Parent = Spinner
+
+    -- animate in
+    Loader.BackgroundTransparency = 1
+    tween(Loader, {BackgroundTransparency = 0}, 0.4)
+    task.wait(0.15)
+    tween(LoadTitle, {TextTransparency = 0}, 0.3)
+    tween(LoadSub,   {TextTransparency = 0}, 0.3)
+    -- spin
+    task.spawn(function()
+        while Loader.Parent do
+            tween(Spinner, {Rotation = Spinner.Rotation + 360}, 0.7, Enum.EasingStyle.Linear)
+            task.wait(0.7)
+        end
+    end)
+
+    -- ===== MAIN FRAME =====
+    local Main = Instance.new("Frame")
+    Main.Name = "Main"
+    Main.Size = UDim2.new(0, 560, 0, 360)
+    Main.Position = UDim2.new(0.5, -280, 0.5, -180)
+    Main.BackgroundColor3 = BG
+    Main.BackgroundTransparency = 1
+    Main.Visible = false
+    Main.Parent = ScreenGui
+
+    local MainCorner = Instance.new("UICorner")
+    MainCorner.CornerRadius = UDim.new(0, 10)
+    MainCorner.Parent = Main
+
+    local MainStroke = Instance.new("UIStroke")
+    MainStroke.Color = BG2
+    MainStroke.Thickness = 1
+    MainStroke.Transparency = 1
+    MainStroke.Parent = Main
+
+    local MainShadow = Instance.new("ImageLabel")
+    MainShadow.Size = UDim2.new(1, 30, 1, 30)
+    MainShadow.Position = UDim2.new(0, -15, 0, -15)
+    MainShadow.BackgroundTransparency = 1
+    MainShadow.Image = "rbxassetid://266543268"
+    MainShadow.ImageColor3 = Color3.fromRGB(0, 0, 0)
+    MainShadow.ImageTransparency = 1
+    MainShadow.ScaleType = Enum.ScaleType.Slice
+    MainShadow.SliceCenter = Rect.new(10, 10, 118, 118)
+    MainShadow.Parent = Main
+    MainShadow.ZIndex = 0
+
+    -- ===== TOP BAR =====
+    local TopBar = Instance.new("Frame")
+    TopBar.Size = UDim2.new(1, 0, 0, 36)
+    TopBar.BackgroundColor3 = BG2
+    TopBar.BackgroundTransparency = 1
+    TopBar.Parent = Main
+    local TopCorner = Instance.new("UICorner")
+    TopCorner.CornerRadius = UDim.new(0, 10)
+    TopCorner.Parent = TopBar
+
+    local Title = Instance.new("TextLabel")
+    Title.Size = UDim2.new(0, 200, 1, 0)
+    Title.Position = UDim2.new(0, 12, 0, 0)
+    Title.BackgroundTransparency = 1
+    Title.Text = "  ChinaV4Egg"
+    Title.Font = Enum.Font.GothamBold
+    Title.TextSize = 14
+    Title.TextColor3 = TXT
+    Title.TextXAlignment = Enum.TextXAlignment.Left
+    Title.Parent = TopBar
+
+    local Dot = Instance.new("Frame")
+    Dot.Size = UDim2.new(0, 8, 0, 8)
+    Dot.Position = UDim2.new(0, 12, 0.5, -4)
+    Dot.BackgroundColor3 = ACCENT
+    Dot.Parent = TopBar
+    local DotCorner = Instance.new("UICorner")
+    DotCorner.CornerRadius = UDim.new(1, 0)
+    DotCorner.Parent = Dot
+
+    -- pulsing dot
+    task.spawn(function()
+        while Main.Parent do
+            tween(Dot, {BackgroundColor3 = ACCENT2}, 0.8)
+            task.wait(0.8)
+            tween(Dot, {BackgroundColor3 = ACCENT}, 0.8)
+            task.wait(0.8)
+        end
+    end)
+
+    local CloseBtn = Instance.new("TextButton")
+    CloseBtn.Size = UDim2.new(0, 30, 0, 30)
+    CloseBtn.Position = UDim2.new(1, -35, 0, 3)
+    CloseBtn.BackgroundColor3 = BG2
+    CloseBtn.BackgroundTransparency = 0
+    CloseBtn.Text = "×"
+    CloseBtn.Font = Enum.Font.GothamBold
+    CloseBtn.TextSize = 18
+    CloseBtn.TextColor3 = TXTDIM
+    CloseBtn.Parent = TopBar
+    local CloseCorner = Instance.new("UICorner")
+    CloseCorner.CornerRadius = UDim.new(0, 6)
+    CloseCorner.Parent = CloseBtn
+
+    CloseBtn.MouseEnter:Connect(function() tween(CloseBtn, {BackgroundColor3 = Color3.fromRGB(60,30,30)}, 0.15) tween(CloseBtn, {TextColor3 = TXT}, 0.15) end)
+    CloseBtn.MouseLeave:Connect(function() tween(CloseBtn, {BackgroundColor3 = BG2}, 0.15) tween(CloseBtn, {TextColor3 = TXTDIM}, 0.15) end)
+    CloseBtn.MouseButton1Click:Connect(function()
+        State.Running = false
+        tween(Main, {Position = UDim2.new(0.5, -280, 0.5, -170), BackgroundTransparency = 1}, 0.25)
+        task.wait(0.3)
+        ScreenGui:Destroy()
+    end)
+
+    -- ===== TAB SIDEBAR =====
+    local Sidebar = Instance.new("Frame")
+    Sidebar.Size = UDim2.new(0, 130, 1, -36)
+    Sidebar.Position = UDim2.new(0, 0, 0, 36)
+    Sidebar.BackgroundColor3 = BG2
+    Sidebar.BackgroundTransparency = 1
+    Sidebar.Parent = Main
+
+    local Tabs = {}
+    local Pages = {}
+
+    local function createTab(name, icon)
+        local TabBtn = Instance.new("TextButton")
+        TabBtn.Size = UDim2.new(1, -20, 0, 30)
+        TabBtn.Position = UDim2.new(0, 10, 0, #Tabs * 36 + 10)
+        TabBtn.BackgroundColor3 = BG
+        TabBtn.BackgroundTransparency = 0
+        TabBtn.Text = "  " .. name
+        TabBtn.Font = Enum.Font.Gotham
+        TabBtn.TextSize = 12
+        TabBtn.TextColor3 = TXTDIM
+        TabBtn.TextXAlignment = Enum.TextXAlignment.Left
+        TabBtn.AutoButtonColor = false
+        TabBtn.Parent = Sidebar
+        local TC = Instance.new("UICorner") TC.CornerRadius = UDim.new(0, 6) TC.Parent = TabBtn
+
+        local Accent = Instance.new("Frame")
+        Accent.Size = UDim2.new(0, 3, 0, 0)
+        Accent.Position = UDim2.new(0, 0, 0.5, 0)
+        Accent.BackgroundColor3 = ACCENT
+        Accent.Parent = TabBtn
+        local AC = Instance.new("UICorner") AC.CornerRadius = UDim.new(1,0) AC.Parent = Accent
+
+        local Page = Instance.new("ScrollingFrame")
+        Page.Size = UDim2.new(0, 410, 1, -56)
+        Page.Position = UDim2.new(0, 140, 0, 46)
+        Page.BackgroundColor3 = BG
+        Page.BackgroundTransparency = 1
+        Page.BorderSizePixel = 0
+        Page.ScrollBarThickness = 3
+        Page.ScrollBarImageColor3 = ACCENT
+        Page.CanvasSize = UDim2.new(0, 0, 0, 0)
+        Page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        Page.Visible = false
+        Page.Parent = Main
+
+        local Layout = Instance.new("UIListLayout")
+        Layout.SortOrder = Enum.SortOrder.LayoutOrder
+        Layout.Padding = UDim.new(0, 6)
+        Layout.Parent = Page
+
+        TabBtn.MouseEnter:Connect(function()
+            if not Tabs[TabBtn].active then tween(TabBtn, {TextColor3 = TXT}, 0.15) end
+        end)
+        TabBtn.MouseLeave:Connect(function()
+            if not Tabs[TabBtn].active then tween(TabBtn, {TextColor3 = TXTDIM}, 0.15) end
+        end)
+
+        Tabs[TabBtn] = {page = Page, active = false, accent = Accent}
+
+        TabBtn.MouseButton1Click:Connect(function()
+            for btn, info in pairs(Tabs) do
+                info.active = false
+                info.page.Visible = false
+                tween(info.accent, {Size = UDim2.new(0, 3, 0, 0)}, 0.2)
+                tween(btn, {TextColor3 = TXTDIM}, 0.2)
+            end
+            Tabs[TabBtn].active = true
+            Page.Visible = true
+            tween(Accent, {Size = UDim2.new(0, 3, 1, 0)}, 0.25)
+            tween(TabBtn, {TextColor3 = TXT}, 0.2)
+            -- little pop
+            Page.Position = UDim2.new(0, 145, 0, 46)
+            tween(Page, {Position = UDim2.new(0, 140, 0, 46)}, 0.2)
+        end)
+
+        return Page
+    end
+
+    -- ===== UI ELEMENTS =====
+    local function addToggle(page, name, desc, default, callback)
+        local Holder = Instance.new("Frame")
+        Holder.Size = UDim2.new(1, -10, 0, 44)
+        Holder.Position = UDim2.new(0, 5, 0, 0)
+        Holder.BackgroundColor3 = BG2
+        Holder.BackgroundTransparency = 0
+        Holder.Parent = page
+        local HC = Instance.new("UICorner") HC.CornerRadius = UDim.new(0, 6) HC.Parent = Holder
+
+        local Label = Instance.new("TextLabel")
+        Label.Size = UDim2.new(1, -60, 0, 18)
+        Label.Position = UDim2.new(0, 12, 0, 6)
+        Label.BackgroundTransparency = 1
+        Label.Text = name
+        Label.Font = Enum.Font.GothamMedium
+        Label.TextSize = 13
+        Label.TextColor3 = TXT
+        Label.TextXAlignment = Enum.TextXAlignment.Left
+        Label.Parent = Holder
+
+        local Desc2 = Instance.new("TextLabel")
+        Desc2.Size = UDim2.new(1, -60, 0, 14)
+        Desc2.Position = UDim2.new(0, 12, 0, 24)
+        Desc2.BackgroundTransparency = 1
+        Desc2.Text = desc
+        Desc2.Font = Enum.Font.Gotham
+        Desc2.TextSize = 10
+        Desc2.TextColor3 = TXTDIM
+        Desc2.TextXAlignment = Enum.TextXAlignment.Left
+        Desc2.Parent = Holder
+
+        local Switch = Instance.new("TextButton")
+        Switch.Size = UDim2.new(0, 38, 0, 20)
+        Switch.Position = UDim2.new(1, -46, 0.5, -10)
+        Switch.BackgroundColor3 = BG
+        Switch.Text = ""
+        Switch.AutoButtonColor = false
+        Switch.Parent = Holder
+        local SC = Instance.new("UICorner") SC.CornerRadius = UDim.new(1,0) SC.Parent = Switch
+
+        local Knob = Instance.new("Frame")
+        Knob.Size = UDim2.new(0, 14, 0, 14)
+        Knob.Position = UDim2.new(0, 3, 0.5, -7)
+        Knob.BackgroundColor3 = TXTDIM
+        Knob.Parent = Switch
+        local KC = Instance.new("UICorner") KC.CornerRadius = UDim.new(1,0) KC.Parent = Knob
+
+        local state = default or false
+
+        local function update(anim)
+            if state then
+                tween(Switch, {BackgroundColor3 = ACCENT}, anim and 0.2 or 0)
+                tween(Knob, {Position = UDim2.new(1, -17, 0.5, -7), BackgroundColor3 = TXT}, anim and 0.2 or 0)
+            else
+                tween(Switch, {BackgroundColor3 = BG}, anim and 0.2 or 0)
+                tween(Knob, {Position = UDim2.new(0, 3, 0.5, -7), BackgroundColor3 = TXTDIM}, anim and 0.2 or 0)
+            end
+        end
+        update(false)
+
+        Switch.MouseButton1Click:Connect(function()
+            state = not state
+            update(true)
+            task.spawn(function() pcall(callback, state) end)
+        end)
+
+        -- expose setter
+        return {
+            Set = function(v) state = v; update(true) end,
+            Get = function() return state end
+        }
+    end
+
+    local function addSlider(page, name, min, max, default, callback)
+        local Holder = Instance.new("Frame")
+        Holder.Size = UDim2.new(1, -10, 0, 50)
+        Holder.Position = UDim2.new(0, 5, 0, 0)
+        Holder.BackgroundColor3 = BG2
+        Holder.BackgroundTransparency = 0
+        Holder.Parent = page
+        local HC = Instance.new("UICorner") HC.CornerRadius = UDim.new(0, 6) HC.Parent = Holder
+
+        local Label = Instance.new("TextLabel")
+        Label.Size = UDim2.new(0, 200, 0, 18)
+        Label.Position = UDim2.new(0, 12, 0, 6)
+        Label.BackgroundTransparency = 1
+        Label.Text = name
+        Label.Font = Enum.Font.GothamMedium
+        Label.TextSize = 13
+        Label.TextColor3 = TXT
+        Label.TextXAlignment = Enum.TextXAlignment.Left
+        Label.Parent = Holder
+
+        local ValueLbl = Instance.new("TextLabel")
+        ValueLbl.Size = UDim2.new(0, 50, 0, 18)
+        ValueLbl.Position = UDim2.new(1, -60, 0, 6)
+        ValueLbl.BackgroundTransparency = 1
+        ValueLbl.Text = tostring(default)
+        ValueLbl.Font = Enum.Font.GothamMedium
+        ValueLbl.TextSize = 13
+        ValueLbl.TextColor3 = ACCENT
+        ValueLbl.TextXAlignment = Enum.TextXAlignment.Right
+        ValueLbl.Parent = Holder
+
+        local Track = Instance.new("Frame")
+        Track.Size = UDim2.new(1, -24, 0, 4)
+        Track.Position = UDim2.new(0, 12, 0, 36)
+        Track.BackgroundColor3 = BG
+        Track.Parent = Holder
+        local TC = Instance.new("UICorner") TC.CornerRadius = UDim.new(1,0) TC.Parent = Track
+
+        local Fill = Instance.new("Frame")
+        Fill.Size = UDim2.new((default - min)/(max - min), 0, 1, 0)
+        Fill.BackgroundColor3 = ACCENT
+        Fill.Parent = Track
+        local FC = Instance.new("UICorner") FC.CornerRadius = UDim.new(1,0) FC.Parent = Fill
+
+        local Knob = Instance.new("Frame")
+        Knob.Size = UDim2.new(0, 12, 0, 12)
+        Knob.Position = UDim2.new(Fill.Size.X.Scale, -6, 0.5, -6)
+        Knob.BackgroundColor3 = TXT
+        Knob.Parent = Track
+        local KC = Instance.new("UICorner") KC.CornerRadius = UDim.new(1,0) KC.Parent = Knob
+
+        local dragging = false
+        local function setFromX(x)
+            local rel = math.clamp((x - Track.AbsolutePosition.X) / Track.AbsoluteSize.X, 0, 1)
+            local val = min + (max - min) * rel
+            val = math.floor(val * 10) / 10
+            tween(Fill, {Size = UDim2.new(rel, 0, 1, 0)}, 0.05)
+            tween(Knob, {Position = UDim2.new(rel, -6, 0.5, -6)}, 0.05)
+            ValueLbl.Text = tostring(val)
+            pcall(callback, val)
+        end
+
+        Track.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = true setFromX(i.Position.X) end end)
+        Track.InputEnded:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end end)
+        UserInputService.InputChanged:Connect(function(i)
+            if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+                setFromX(i.Position.X)
+            end
+        end)
+    end
+
+    local function addLabel(page, text)
+        local Lbl = Instance.new("TextLabel")
+        Lbl.Size = UDim2.new(1, -10, 0, 20)
+        Lbl.Position = UDim2.new(0, 5, 0, 0)
+        Lbl.BackgroundTransparency = 1
+        Lbl.Text = "  " .. text
+        Lbl.Font = Enum.Font.GothamBold
+        Lbl.TextSize = 12
+        Lbl.TextColor3 = ACCENT
+        Lbl.TextXAlignment = Enum.TextXAlignment.Left
+        Lbl.Parent = page
+    end
+
+    local function addButton(page, name, callback)
+        local Btn = Instance.new("TextButton")
+        Btn.Size = UDim2.new(1, -10, 0, 34)
+        Btn.Position = UDim2.new(0, 5, 0, 0)
+        Btn.BackgroundColor3 = BG2
+        Btn.Text = name
+        Btn.Font = Enum.Font.GothamMedium
+        Btn.TextSize = 13
+        Btn.TextColor3 = TXT
+        Btn.AutoButtonColor = false
+        Btn.Parent = page
+        local BC = Instance.new("UICorner") BC.CornerRadius = UDim.new(0, 6) BC.Parent = Btn
+        Btn.MouseEnter:Connect(function() tween(Btn, {BackgroundColor3 = ACCENT, TextColor3 = BG}, 0.15) end)
+        Btn.MouseLeave:Connect(function() tween(Btn, {BackgroundColor3 = BG2, TextColor3 = TXT}, 0.15) end)
+        Btn.MouseButton1Click:Connect(function() task.spawn(callback) end)
+    end
+
+    -- ===== TABS =====
+    local PageFarm   = createTab("Autofarm",  "")
+    local PageCombat = createTab("Player",    "")
+    local PageMove   = createTab("Movement",  "")
+    local PageVisual = createTab("Visuals",   "")
+    local PageMisc   = createTab("Misc",      "")
+
+    -- AUTOFARM PAGE
+    addLabel(PageFarm, "EGG COLLECTION")
+    local tFarm = addToggle(PageFarm, "AutoFarm Eggs", "Auto-collect spawned eggs", false, function(v) Config.AutoFarm = v end)
+    addLabel(PageFarm, "STEALING")
+    local tSteal = addToggle(PageFarm, "AutoSteal Players", "Touch players to steal eggs", false, function(v) Config.AutoSteal = v end)
+    addLabel(PageFarm, "DEPOSIT")
+    local tDeposit = addToggle(PageFarm, "AutoDeposit", "Walk to deposit zone when full", false, function(v) Config.AutoDeposit = v end)
+    addSlider(PageFarm, "Farm Range", 3, 30, Config.CollectRange, function(v) Config.CollectRange = v end)
+    addSlider(PageFarm, "Steal Range", 3, 30, Config.StealRange, function(v) Config.StealRange = v end)
+
+    -- PLAYER PAGE
+    addLabel(PageCombat, "TARGETING")
+    addLabel(PageCombat, "PHYSICAL")
+    local tJump = addToggle(PageCombat, "Infinite Jump", "Jump anytime in midair", false, function(v) Config.InfJump = v end)
+
+    -- MOVEMENT PAGE
+    addLabel(PageMove, "SPEED")
+    local tSpeed = addToggle(PageMove, "Speed Boost", "Move faster (bypassed)", false, function(v) Config.SpeedEnabled = v end)
+    addSlider(PageMove, "Speed", 16, 200, Config.Speed, function(v) Config.Speed = v end)
+    addLabel(PageMove, "PHYSICS")
+    local tClip = addToggle(PageMove, "Noclip", "Walk through walls", false, function(v) Config.NoClip = v end)
+
+    -- VISUALS PAGE
+    addLabel(PageVisual, "ESP")
+    local tEggESP = addToggle(PageVisual, "Egg ESP", "Highlight all eggs", false, function(v) Config.EggESP = v end)
+    local tPlyESP = addToggle(PageVisual, "Player ESP", "Highlight other players", false, function(v) Config.PlayerESP = v end)
+
+    -- MISC PAGE
+    addLabel(PageMisc, "AUTOMATION")
+    local tAFK = addToggle(PageMisc, "Anti-AFK", "Block idle kicks", true, function(v) Config.AntiAFK = v end)
+    local tRejoin = addToggle(PageMisc, "AutoRejoin", "Rejoin on disconnect", false, function(v) Config.AutoRejoin = v end)
+    addLabel(PageMisc, "SERVER")
+    addButton(PageMisc, "Server Hop (Find New)", function() serverHop() end)
+    addButton(PageMisc, "Rejoin This Server", function() rejoin() end)
+    addLabel(PageMisc, "STATS")
+    addButton(PageMisc, "Copy JobId", function()
+        if setclipboard then setclipboard(game.JobId) end
+        notify("Copied: " .. game.JobId)
+    end)
+
+    -- ===== TOAST NOTIFICATIONS =====
+    local ToastHolder = Instance.new("Frame")
+    ToastHolder.Size = UDim2.new(0, 280, 1, 0)
+    ToastHolder.Position = UDim2.new(1, -300, 0, 0)
+    ToastHolder.BackgroundTransparency = 1
+    ToastHolder.Parent = ScreenGui
+
+    local ToastLayout = Instance.new("UIListLayout")
+    ToastLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    ToastLayout.VerticalAlignment = Enum.VerticalAlignment.Bottom
+    ToastLayout.Padding = UDim.new(0, 6)
+    ToastLayout.Parent = ToastHolder
+
+    function notify(text)
+        task.spawn(function()
+            local Toast = Instance.new("Frame")
+            Toast.Size = UDim2.new(1, 0, 0, 32)
+            Toast.BackgroundColor3 = BG2
+            Toast.BackgroundTransparency = 1
+            Toast.Parent = ToastHolder
+            local TC = Instance.new("UICorner") TC.CornerRadius = UDim.new(0, 6) TC.Parent = Toast
+
+            local AccentBar = Instance.new("Frame")
+            AccentBar.Size = UDim2.new(0, 3, 1, -6)
+            AccentBar.Position = UDim2.new(0, 6, 0, 3)
+            AccentBar.BackgroundColor3 = ACCENT
+            AccentBar.Parent = Toast
+            local AC = Instance.new("UICorner") AC.CornerRadius = UDim.new(1,0) AC.Parent = AccentBar
+
+            local Lbl = Instance.new("TextLabel")
+            Lbl.Size = UDim2.new(1, -20, 1, 0)
+            Lbl.Position = UDim2.new(0, 16, 0, 0)
+            Lbl.BackgroundTransparency = 1
+            Lbl.Text = text
+            Lbl.Font = Enum.Font.Gotham
+            Lbl.TextSize = 12
+            Lbl.TextColor3 = TXT
+            Lbl.TextXAlignment = Enum.TextXAlignment.Left
+            Lbl.TextTruncate = Enum.TextTruncate.AtEnd
+            Lbl.Parent = Toast
+
+            Toast.Position = UDim2.new(1, 0, 1, 0)
+            tween(Toast, {BackgroundTransparency = 0, Position = UDim2.new(0, 0, 1, 0)}, 0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+            task.wait(3.5)
+            tween(Toast, {BackgroundTransparency = 1, Position = UDim2.new(1, 20, 1, 0)}, 0.3)
+            task.wait(0.3)
+            Toast:Destroy()
+        end)
+    end
+
+    -- ===== DRAGGING =====
+    local dragging, dragStart, startPos
+    TopBar.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = i.Position
+            startPos = Main.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local delta = i.Position - dragStart
+            tween(Main, {Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)}, 0.05)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    -- ===== TOGGLE KEY =====
+    UserInputService.InputBegan:Connect(function(i, gp)
+        if gp then return end
+        if i.KeyCode == Enum.KeyCode.RightShift then
+            State.UIVisible = not State.UIVisible
+            if State.UIVisible then
+                Main.Visible = true
+                Main.Position = UDim2.new(0.5, -280, 0.5, -160)
+                tween(Main, {Position = UDim2.new(0.5, -280, 0.5, -180), BackgroundTransparency = 0}, 0.25)
+                tween(MainShadow, {ImageTransparency = 0.5}, 0.25)
+                tween(MainStroke, {Transparency = 0}, 0.25)
+            else
+                tween(Main, {Position = UDim2.new(0.5, -280, 0.5, -200), BackgroundTransparency = 1}, 0.2)
+                tween(MainShadow, {ImageTransparency = 1}, 0.2)
+                tween(MainStroke, {Transparency = 1}, 0.2)
+                task.delay(0.2, function() if not State.UIVisible then Main.Visible = false end end)
+            end
+        end
+    end)
+
+    -- expose UI globally for tabs
+    UI.notify = notify
+    UI.Main = Main
+end
+
+-- ========== ESP SYSTEM ==========
+local function setEggESP(on)
+    -- clear existing
+    for _, h in pairs(State.Highlights) do
+        if h and h.Parent then h:Destroy() end
+    end
+    State.Highlights = {}
+
+    if not on then return end
+
+    task.spawn(function()
+        while Config.EggESP do
+            for _, egg in ipairs(getEggs()) do
+                local part = egg:IsA("Model") and egg.PrimaryPart or egg
+                if part then
+                    if not part:FindFirstChild("__CHINAESP") then
+                        local h = Instance.new("Highlight")
+                        h.Name = "__CHINAESP"
+                        h.FillColor = Color3.fromRGB(120, 200, 120)
+                        h.OutlineColor = Color3.fromRGB(255,255,255)
+                        h.FillTransparency = 0.5
+                        h.OutlineTransparency = 0
+                        h.Parent = part
+                        State.Highlights[part] = h
+                    end
+                end
+            end
+            task.wait(1)
+        end
+        -- clean up
+        for _, h in pairs(State.Highlights) do
+            if h and h.Parent then h:Destroy() end
+        end
+        State.Highlights = {}
+    end)
+end
+
+local function setPlayerESP(on)
+    task.spawn(function()
+        if on then
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer and p.Character then
+                    local h = p.Character:FindFirstChild("__CHINAPLAYESP")
+                    if not h then
+                        h = Instance.new("Highlight")
+                        h.Name = "__CHINAPLAYESP"
+                        h.FillColor = Color3.fromRGB(220, 60, 60)
+                        h.OutlineColor = Color3.fromRGB(255,255,255)
+                        h.FillTransparency = 0.6
+                        h.OutlineTransparency = 0
+                        h.Parent = p.Character
+                    end
+                end
+            end
+        else
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer and p.Character then
+                    local h = p.Character:FindFirstChild("__CHINAPLAYESP")
+                    if h then h:Destroy() end
+                end
+            end
+        end
+    end)
+end
+
+-- ========== ANTI-AFK ==========
+local PlayerConnections = {}
+PlayerConnections.AntiAFK = LocalPlayer.Idled:Connect(function()
+    if Config.AntiAFK then
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton1(Vector2.new())
+    end
+end)
+
+-- ========== INFINITE JUMP ==========
+UserInputService.JumpRequest:Connect(function()
+    if Config.InfJump then
+        local char = LocalPlayer.Character
+        if char and char:FindFirstChild("Humanoid") then
+            char.Humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end
+end)
+
+-- ========== NOCLIP ==========
+RunService.Stepped:Connect(function()
+    if Config.NoClip then
+        local char = LocalPlayer.Character
+        if char then
+            for _, p in ipairs(char:GetDescendants()) do
+                if p:IsA("BasePart") and p.CanCollide then
+                    p.CanCollide = false
+                end
+            end
+        end
+    end
+end)
+
+-- ========== SPEED ==========
+local speedConn
+local function applySpeed(on)
+    if speedConn then speedConn:Disconnect() speedConn = nil end
+    if not on then return end
+    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    local hum = char:WaitForChild("Humanoid")
+    local root = char:WaitForChild("HumanoidRootPart")
+
+    -- bypass: keep WalkSpeed = 16, but apply velocity-based boost
+    speedConn = RunService.Heartbeat:Connect(function()
+        if not Config.SpeedEnabled then return end
+        local c = LocalPlayer.Character
+        if not c then return end
+        local r = c:FindFirstChild("HumanoidRootPart")
+        local h = c:FindFirstChild("Humanoid")
+        if not r or not h then return end
+        if h.MoveDirection.Magnitude > 0 then
+            -- apply velocity in move direction (bypasses WalkSpeed check)
+            local dir = h.MoveDirection.Unit
+            r.AssemblyLinearVelocity = Vector3.new(dir.X * Config.Speed, r.AssemblyLinearVelocity.Y, dir.Z * Config.Speed)
+        end
+        -- spoof WalkSpeed so server sees 16
+        if h.WalkSpeed ~= 16 then h.WalkSpeed = 16 end
+    end)
+end
+
+-- ========== AUTOFARM LOOPS ==========
+local function autoFarmLoop()
+    task.spawn(function()
+        while State.Running do
+            if Config.AutoFarm then
+                local char = LocalPlayer.Character
+                if char and char:FindFirstChild("HumanoidRootPart") then
+                    local root = char.HumanoidRootPart
+                    local eggs = getEggs()
+                    for _, egg in ipairs(eggs) do
+                        local part = egg:IsA("Model") and (egg.PrimaryPart or egg:FindFirstChildWhichIsA("BasePart")) or egg
+                        if part then
+                            local d = (root.Position - part.Position).Magnitude
+                            if d <= Config.CollectRange then
+                                -- touch it
+                                firetouchinterest(root, part, 0)
+                                task.wait(0.02)
+                                firetouchinterest(root, part, 1)
+                            elseif d <= 50 then
+                                -- walk to it
+                                walkTo(part.Position, Config.Speed)
+                            end
+                        end
+                    end
+                end
+            end
+            task.wait(Config.FarmDelay)
+        end
+    end)
+end
+
+local function autoStealLoop()
+    task.spawn(function()
+        while State.Running do
+            if Config.AutoSteal then
+                local char = LocalPlayer.Character
+                if char and char:FindFirstChild("HumanoidRootPart") then
+                    local root = char.HumanoidRootPart
+                    local players = getOtherPlayers()
+                    for _, p in ipairs(players) do
+                        local target = p.Character:FindFirstChild("HumanoidRootPart")
+                        if target then
+                            local d = (root.Position - target.Position).Magnitude
+                            if d <= Config.StealRange then
+                                firetouchinterest(root, target, 0)
+                                task.wait(0.02)
+                                firetouchinterest(root, target, 1)
+                            elseif d <= 60 then
+                                walkTo(target.Position, Config.Speed)
+                            end
+                        end
+                    end
+                end
+            end
+            task.wait(Config.StealDelay)
+        end
+    end)
+end
+
+local function autoDepositLoop()
+    task.spawn(function()
+        while State.Running do
+            if Config.AutoDeposit then
+                local char = LocalPlayer.Character
+                if char and char:FindFirstChild("HumanoidRootPart") then
+                    local root = char.HumanoidRootPart
+                    -- only deposit if we're near a deposit zone
+                    local zones = getDepositZones()
+                    local closest, dist = closestFrom(zones)
+                    if closest then
+                        local part = closest:IsA("Model") and (closest.PrimaryPart or closest:FindFirstChildWhichIsA("BasePart")) or closest
+                        if part and (dist or 999) > 4 then
+                            walkTo(part.Position, Config.Speed)
+                        elseif part and (dist or 999) <= 4 then
+                            firetouchinterest(root, part, 0)
+                            task.wait(0.05)
+                            firetouchinterest(root, part, 1)
+                        end
+                    end
+                end
+            end
+            task.wait(Config.DepositDelay)
+        end
+    end)
+end
+
+-- ========== AUTO REJOIN ==========
+local function autoRejoinLoop()
+    task.spawn(function()
+        while State.Running do
+            task.wait(5)
+            if Config.AutoRejoin and not game:GetService("NetworkClient"):GetConnections()[1] then
+                TeleportService:Teleport(game.PlaceId, LocalPlayer)
+            end
+        end
+    end)
+end
+
+function rejoin()
+    UI.notify("Rejoining server...")
+    TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+end
+
+function serverHop()
+    UI.notify("Hopping servers...")
+    local existingJson
+    pcall(function()
+        existingJson = game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100")
+    end)
+    if not existingJson then UI.notify("Could not fetch server list") return end
+
+    local decoded = HttpService:JSONDecode(existingJson)
+    if not decoded or not decoded.data then UI.notify("Bad server response") return end
+
+    local candidates = {}
+    for _, s in ipairs(decoded.data) do
+        if s.playing < s.maxPlayers and s.id ~= game.JobId then
+            table.insert(candidates, s)
+        end
+    end
+
+    if #candidates == 0 then UI.notify("No other servers found") return end
+
+    local target = candidates[math.random(1, #candidates)]
+    UI.notify("Hopping to server: " .. tostring(target.id))
+    TeleportService:TeleportToPlaceInstance(game.PlaceId, target.id, LocalPlayer)
+end
+
+-- ========== RESPAWN HANDLING ==========
+LocalPlayer.CharacterAdded:Connect(function(char)
+    task.wait(1)
+    -- re-apply ESP if enabled
+    if Config.EggESP then setEggESP(true) end
+    if Config.PlayerESP then setPlayerESP(true) end
+    -- re-apply speed
+    if Config.SpeedEnabled then applySpeed(true) end
+end)
+
+-- ========== BOOTSTRAP ==========
+local function bootstrap()
+    -- wait for character
+    if not LocalPlayer.Character then
+        LocalPlayer.CharacterAdded:Wait()
+    end
+    task.wait(0.5)
+
+    -- wire up ESP toggles
+    -- (the toggles already call Config update; we need to also trigger the visual system)
+    -- we hook into config changes via a small poller:
+    task.spawn(function()
+        local lastEgg, lastPly
+        while State.Running do
+            if Config.EggESP ~= lastEgg then
+                lastEgg = Config.EggESP
+                setEggESP(lastEgg)
+            end
+            if Config.PlayerESP ~= lastPly then
+                lastPly = Config.PlayerESP
+                setPlayerESP(lastPly)
+            end
+            task.wait(0.5)
+        end
+    end)
+
+    -- wire up speed
+    task.spawn(function()
+        local last
+        while State.Running do
+            if Config.SpeedEnabled ~= last then
+                last = Config.SpeedEnabled
+                applySpeed(last)
+            end
+            task.wait(0.5)
+        end
+    end)
+
+    -- start farm loops
+    autoFarmLoop()
+    autoStealLoop()
+    autoDepositLoop()
+    autoRejoinLoop()
+
+    State.Loaded = true
+end
+
+-- ========== HIDE LOADER + SHOW MAIN ==========
+task.spawn(function()
+    -- show loading for ~2.5s
+    task.wait(0.4)
+    local LoadSub = UI.Screen:FindFirstChild("Main") and nil -- quick ref not needed
+    task.wait(2)
+    local loader = UI.Screen:FindFirstChildWhichIsA("Frame")
+    if loader then
+        tween(loader, {BackgroundTransparency = 1}, 0.3)
+        for _, c in ipairs(loader:GetChildren()) do
+            if c:IsA("TextLabel") then tween(c, {TextTransparency = 1}, 0.3) end
+        end
+        task.wait(0.3)
+        loader:Destroy()
+    end
+
+    -- show main
+    local main = UI.Main
+    main.Visible = true
+    main.BackgroundTransparency = 1
+    main.Position = UDim2.new(0.5, -280, 0.5, -160)
+    tween(main, {Position = UDim2.new(0.5, -280, 0.5, -180), BackgroundTransparency = 0}, 0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+
+    -- notify
+    task.wait(0.4)
+    UI.notify("ChinaV4Egg loaded — press RightShift to toggle UI")
+    UI.notify("Anti-AFK active")
+end)
+
+bootstrap()
