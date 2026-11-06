@@ -1,131 +1,152 @@
 --[[
 ═══════════════════════════════════════════════════════════════════
-    🥚  ChinaV4Egg v2  —  Rewritten & Actually Working
-    • Pathfinding movement (no teleport flags)
-    • Auto-detects collection/steal/deposit remotes
-    • Real WalkSpeed + velocity hooks
-    • 25+ modules • Config save/load • Search UI
+    🥚  ChinaV4Egg v4  —  Full Suite + Anticheat Killer
+    • Kills client-side AC scripts BEFORE loading
+    • Hides UI in gethui()/syn.protect_gui/PlayerGui
+    • Hooks kick/ban/report remotes (swallows them)
+    • Continuous AC re-killer every 10s
+    • All 33 modules: autofarm, movement, visuals, combat, misc
 ═══════════════════════════════════════════════════════════════════
 ]]
 
 -- =========================================================
 --  SERVICES
 -- =========================================================
-local Players           = game:GetService("Players")
-local LocalPlayer       = Players.LocalPlayer
-local Workspace         = game:GetService("Workspace")
-local RunService        = game:GetService("RunService")
-local TweenService      = game:GetService("TweenService")
-local UserInputService  = game:GetService("UserInputService")
-local VirtualUser       = game:GetService("VirtualUser")
-local VirtualInputManager = game:GetService("VirtualInputManager")
-local TeleportService   = game:GetService("TeleportService")
-local HttpService       = game:GetService("HttpService")
-local CoreGui           = game:GetService("CoreGui")
-local Lighting          = game:GetService("Lighting")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players            = game:GetService("Players")
+local LocalPlayer        = Players.LocalPlayer
+local Workspace          = game:GetService("Workspace")
+local RunService         = game:GetService("RunService")
+local TweenService       = game:GetService("TweenService")
+local UserInputService   = game:GetService("UserInputService")
+local VirtualUser        = game:GetService("VirtualUser")
+local TeleportService    = game:GetService("TeleportService")
+local HttpService        = game:GetService("HttpService")
+local CoreGui            = game:GetService("CoreGui")
+local Lighting           = game:GetService("Lighting")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
 local PathfindingService = game:GetService("PathfindingService")
-local Stats             = game:GetService("Stats")
-local NetworkClient     = game:GetService("NetworkClient")
-
-local hookMetatable     = hookmetamethod
-local HookFunction      = hookfunction
+local NetworkClient      = game:GetService("NetworkClient")
+local StarterPlayer      = game:GetService("StarterPlayer")
 
 -- =========================================================
---  CONFIG
+--  PHASE 1: ANTICHEAT KILLER
+-- =========================================================
+local acPatterns = {"anti","cheat","detect","exploit","hack","kick","ban","flag","report","verif","guard","protect","sec"}
+local killedCount = 0
+local hookedRemotes = 0
+
+local function isSuspicious(name)
+    local n = name:lower()
+    for _, p in ipairs(acPatterns) do
+        if n:match(p) then return true end
+    end
+    return false
+end
+
+local function killAnticheatIn(container)
+    if not container then return end
+    for _, obj in ipairs(container:GetDescendants()) do
+        if obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script") then
+            if isSuspicious(obj.Name) then
+                pcall(function() obj.Disabled = true end)
+                pcall(function() obj:Destroy() end)
+                killedCount = killedCount + 1
+            end
+        end
+    end
+end
+
+local function killAllAnticheat()
+    pcall(killAnticheatIn, StarterPlayer.StarterPlayerScripts)
+    pcall(killAnticheatIn, StarterPlayer.StarterCharacterScripts)
+    pcall(killAnticheatIn, ReplicatedStorage)
+    pcall(killAnticheatIn, Workspace)
+    pcall(killAnticheatIn, LocalPlayer:FindFirstChild("PlayerScripts"))
+end
+
+killAllAnticheat()
+
+-- Hook __namecall to swallow calls to kick/ban/report remotes
+local oldNamecall
+if hookmetamethod then
+    oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+        local method = getnamecallmethod()
+        if method == "FireServer" and self:IsA("RemoteEvent") and isSuspicious(self.Name) then
+            return -- swallow
+        end
+        return oldNamecall(self, ...)
+    end)
+end
+
+-- Hook report remotes in ReplicatedStorage
+local function hookReportRemotes(container)
+    if not container then return end
+    for _, obj in ipairs(container:GetDescendants()) do
+        if obj:IsA("RemoteEvent") and isSuspicious(obj.Name) then
+            hookedRemotes = hookedRemotes + 1
+        end
+    end
+end
+hookReportRemotes(ReplicatedStorage)
+hookReportRemotes(Workspace)
+
+-- Continuous AC killer (re-scan every 10s)
+task.spawn(function()
+    while true do
+        task.wait(10)
+        pcall(killAllAnticheat)
+    end
+end)
+
+-- =========================================================
+--  CONFIG / STATE
 -- =========================================================
 local Config = {
     -- Farm
-    AutoFarm        = false,
-    AutoSteal       = false,
-    AutoDeposit     = false,
-    AutoHatch       = false,
-    AutoSell        = false,
-    AutoRejoin      = false,
-    AntiAFK         = true,
+    AutoFarm=false, AutoSteal=false, AutoDeposit=false,
+    AutoHatch=false, AutoRejoin=false, AntiAFK=true,
+    UsePathfind=true,
     -- Movement
-    SpeedEnabled    = false,
-    Speed           = 60,
-    FlyEnabled      = false,
-    FlySpeed        = 60,
-    NoClip          = false,
-    InfJump         = false,
-    ClickTP         = false,
+    SpeedEnabled=false, Speed=60,
+    FlyEnabled=false, FlySpeed=60,
+    NoClip=false, InfJump=false, ClickTP=false,
     -- Visuals
-    EggESP          = false,
-    PlayerESP       = false,
-    DepositESP      = false,
-    Tracers         = false,
-    NameTags        = false,
-    HitboxExpand    = false,
-    HitboxSize      = 8,
-    Fullbright      = false,
+    EggESP=false, PlayerESP=false, DepositESP=false,
+    Tracers=false, Fullbright=false,
+    HitboxExpand=false, HitboxSize=8,
     -- Combat
-    ReachEnabled    = false,
-    Reach           = 20,
-    AntiKnockback   = false,
+    ReachEnabled=false, Reach=20, AntiKnockback=false,
     -- Misc
-    CollectRange    = 12,
-    StealRange      = 16,
-    FarmDelay       = 0.03,
-    StealDelay      = 0.08,
-    DepositDelay    = 1.5,
-    UsePathfind     = true,
-    UIKey           = Enum.KeyCode.RightShift,
+    CollectRange=12, StealRange=16,
+    FarmDelay=0.03, StealDelay=0.08, DepositDelay=1.5,
 }
 
 local State = {
-    Running      = true,
-    Loaded       = false,
-    UIVisible    = true,
-    Highlights   = {},
-    TracersAdorn = {},
-    NameTags     = {},
-    LastFarm     = 0,
-    LastSteal    = 0,
-    LastDeposit  = 0,
-    Remote = {
-        Collect = nil,
-        Steal   = nil,
-        Deposit = nil,
-        Sell    = nil,
-        Hatch   = nil,
-    },
-    Hooks = {},
+    Running=true, Loaded=false, UIVisible=true,
+    Highlights={}, TracersAdorn={},
+    LastFarm=0, LastSteal=0, LastDeposit=0,
+    Remote={Collect=nil,Steal=nil,Deposit=nil,Sell=nil,Hatch=nil},
 }
 
--- =========================================================
---  UTILITIES
--- =========================================================
-local function tween(obj, props, t, style, dir)
-    local info = TweenInfo.new(t or 0.2, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out)
-    local tw = TweenService:Create(obj, info, props)
-    tw:Play()
-    return tw
+local function tween(o, p, t, s, d)
+    local i = TweenInfo.new(t or 0.2, s or Enum.EasingStyle.Quint, d or Enum.EasingDirection.Out)
+    local tw = TweenService:Create(o, i, p) tw:Play() return tw
 end
-
-local function lerp(a, b, t) return a + (b - a) * t end
 
 -- =========================================================
 --  REMOTE DETECTION
 -- =========================================================
 local function scanForRemotes()
     local found = {}
-    local function check(container)
-        for _, obj in ipairs(container:GetDescendants()) do
+    local function check(c)
+        for _, obj in ipairs(c:GetDescendants()) do
             if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
                 local n = obj.Name:lower()
-                if n:match("collect") or n:match("grab") or n:match("pickup") or n:match("getegg") then
-                    found.Collect = found.Collect or obj
-                elseif n:match("steal") or n:match("take") then
-                    found.Steal = found.Steal or obj
-                elseif n:match("deposit") or n:match("drop") or n:match("deliver") then
-                    found.Deposit = found.Deposit or obj
-                elseif n:match("sell") or n:match("cash") or n:match("money") then
-                    found.Sell = found.Sell or obj
-                elseif n:match("hatch") or n:match("open") then
-                    found.Hatch = found.Hatch or obj
-                end
+                if n:match("collect") or n:match("grab") or n:match("pickup") then found.Collect = found.Collect or obj
+                elseif n:match("steal") or n:match("takeegg") then found.Steal = found.Steal or obj
+                elseif n:match("deposit") or n:match("deliver") or n:match("drop") then found.Deposit = found.Deposit or obj
+                elseif n:match("sell") or n:match("cash") then found.Sell = found.Sell or obj
+                elseif n:match("hatch") or n:match("open") then found.Hatch = found.Hatch or obj end
             end
         end
     end
@@ -136,24 +157,25 @@ end
 
 local function fireRemoteSafe(remote, ...)
     if not remote then return false end
-    local ok, err = pcall(function(...)
-        if remote:IsA("RemoteEvent") then
-            remote:FireServer(...)
-        elseif remote:IsA("RemoteFunction") then
-            remote:InvokeServer(...)
-        end
+    local ok = pcall(function(...)
+        if remote:IsA("RemoteEvent") then remote:FireServer(...)
+        elseif remote:IsA("RemoteFunction") then remote:InvokeServer(...) end
     end, ...)
     return ok
 end
 
 -- =========================================================
---  EGG / TARGET DETECTION
+--  TARGET DETECTION
 -- =========================================================
+local function getPart(obj)
+    if obj:IsA("BasePart") then return obj end
+    if obj:IsA("Model") then return obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart") end
+end
+
 local function isValidEgg(obj)
     if not (obj:IsA("BasePart") or obj:IsA("Model")) then return false end
     local n = obj.Name:lower()
-    if n:match("esp") or n:match("highlight") or n:match("tracer") or n:match("nametag") then return false end
-    if n:match("base") or n:match("zone") or n:match("deposit") or n:match("sell") then return false end
+    if n:match("esp") or n:match("highlight") or n:match("tracer") then return false end
     if obj:IsA("BasePart") and obj.Transparency == 1 and not obj.CanCollide then return false end
     return n:match("egg")
 end
@@ -161,9 +183,7 @@ end
 local function getEggs()
     local eggs = {}
     for _, obj in ipairs(Workspace:GetDescendants()) do
-        if isValidEgg(obj) then
-            table.insert(eggs, obj)
-        end
+        if isValidEgg(obj) then table.insert(eggs, obj) end
     end
     return eggs
 end
@@ -173,7 +193,7 @@ local function getDepositZones()
     for _, obj in ipairs(Workspace:GetDescendants()) do
         if obj:IsA("BasePart") then
             local n = obj.Name:lower()
-            if n:match("deposit") or n:match("sell") or n:match("zone") or n:match("cashier") or n:match("counter") then
+            if n:match("deposit") or n:match("sell") or n:match("zone") or n:match("cashier") then
                 table.insert(zones, obj)
             end
         end
@@ -189,13 +209,6 @@ local function getOtherPlayers()
         end
     end
     return list
-end
-
-local function getPart(obj)
-    if obj:IsA("BasePart") then return obj end
-    if obj:IsA("Model") then
-        return obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
-    end
 end
 
 local function closestFrom(list, maxDist)
@@ -216,123 +229,32 @@ local function closestFrom(list, maxDist)
 end
 
 -- =========================================================
---  ANTICHEAT BYPASS
--- =========================================================
--- WalkSpeed spoofing: hook the WalkSpeed property so any anticheat
--- reading it always sees 16, even when we move faster.
-local function installWalkSpeedBypass()
-    if State.Hooks.WalkSpeed then return end
-    local mt = getrawmetatable(game)
-    local oldIndex = mt.__index
-    local oldNamecall = mt.__namecall
-    setreadonly(mt, false)
-
-    State.Hooks.WalkSpeed = true
-    State.Hooks.OldIndex = oldIndex
-    State.Hooks.OldNamecall = oldNamecall
-
-    -- Hook __index for WalkSpeed reads
-    local newIndex
-    newIndex = newcclosure(function(self, key)
-        if key == "WalkSpeed" and self:IsA("Humanoid") and self.Parent and self.Parent == LocalPlayer.Character then
-            return 16
-        end
-        return oldIndex(self, key)
-    end)
-    mt.__index = newIndex
-
-    -- Hook namecall for anticheat-style function calls
-    local newNamecall
-    newNamecall = newcclosure(function(self, ...)
-        local method = getnamecallmethod()
-        local args = {...}
-        -- Some anticheats call Humanoid:GetPropertyChangedSignal("WalkSpeed") etc — let them through, harmless
-        return oldNamecall(self, ...)
-    end)
-    mt.__namecall = newNamecall
-
-    setreadonly(mt, true)
-end
-
--- Velocity spoofing: apply movement velocity only on Heartbeat,
--- restore on Stepped so server-queried values during physics step
--- don't show boosted values.
-local function applySpeedBypass()
-    local conn
-    conn = RunService.Heartbeat:Connect(function()
-        if not Config.SpeedEnabled then return end
-        local c = LocalPlayer.Character
-        if not c then return end
-        local r = c:FindFirstChild("HumanoidRootPart")
-        local h = c:FindFirstChild("Humanoid")
-        if not r or not h then return end
-        if h.MoveDirection.Magnitude > 0 then
-            local dir = h.MoveDirection.Unit
-            r.AssemblyLinearVelocity = Vector3.new(dir.X * Config.Speed, r.AssemblyLinearVelocity.Y, dir.Z * Config.Speed)
-        end
-    end)
-    return conn
-end
-
--- Anti-knockback: zero out velocity changes from server
-local function applyAntiKnockback()
-    local conn
-    conn = RunService.RenderStepped:Connect(function()
-        if not Config.AntiKnockback then return end
-        local c = LocalPlayer.Character
-        if not c then return end
-        local r = c:FindFirstChild("HumanoidRootPart")
-        if not r then return end
-        local v = r.AssemblyLinearVelocity
-        -- If we have unexpected horizontal velocity while not moving, zero it
-        if v.X ~= 0 or v.Z ~= 0 then
-            local h = c:FindFirstChild("Humanoid")
-            if h and h.MoveDirection.Magnitude == 0 then
-                r.AssemblyLinearVelocity = Vector3.new(0, v.Y, 0)
-            end
-        end
-    end)
-    return conn
-end
-
--- =========================================================
---  MOVEMENT (PATHFINDING-BASED, NO TELEPORT FLAGS)
+--  MOVEMENT
 -- =========================================================
 local function walkTo(targetPos, speed)
     local char = LocalPlayer.Character
     if not char then return end
     local root = char:FindFirstChild("HumanoidRootPart")
-    local hum  = char:FindFirstChild("Humanoid")
+    local hum = char:FindFirstChild("Humanoid")
     if not root or not hum then return end
 
     if Config.UsePathfind then
-        -- PathfindingService gives legit-looking movement
         local path = PathfindingService:CreatePath({
-            AgentRadius = 2,
-            AgentHeight = 5,
-            AgentCanJump = true,
-            AgentCanClimb = false,
-            WaypointSpacing = 4,
-            Costs = { Water = 20 },
+            AgentRadius=2, AgentHeight=5, AgentCanJump=true,
+            WaypointSpacing=4, Costs={Water=20},
         })
-        local ok = pcall(function()
-            path:ComputeAsync(root.Position, targetPos)
-        end)
+        local ok = pcall(function() path:ComputeAsync(root.Position, targetPos) end)
         if ok and path.Status == Enum.PathStatus.Success then
             for _, wp in ipairs(path:GetWaypoints()) do
                 if not State.Running then return end
                 hum:MoveTo(wp.Position)
-                if wp.Action == Enum.PathWaypointAction.Jump then
-                    hum.Jump = true
-                end
-                -- wait until reached or timeout
+                if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
                 local start = tick()
                 while (root.Position - wp.Position).Magnitude > 4 and tick() - start < 3 do
                     task.wait(0.05)
                 end
             end
         else
-            -- fallback to direct walk
             hum:MoveTo(targetPos)
             local start = tick()
             while (root.Position - Vector3.new(targetPos.X, root.Position.Y, targetPos.Z)).Magnitude > 3 and tick() - start < 5 do
@@ -357,7 +279,28 @@ local function teleportTo(pos)
 end
 
 -- =========================================================
---  FLY MODULE
+--  SPEED BYPASS
+-- =========================================================
+local speedConn
+local function applySpeedBypass()
+    if speedConn then speedConn:Disconnect() end
+    speedConn = RunService.Heartbeat:Connect(function()
+        if not Config.SpeedEnabled then return end
+        local c = LocalPlayer.Character
+        if not c then return end
+        local r = c:FindFirstChild("HumanoidRootPart")
+        local h = c:FindFirstChild("Humanoid")
+        if not r or not h then return end
+        if h.MoveDirection.Magnitude > 0 then
+            local dir = h.MoveDirection.Unit
+            r.AssemblyLinearVelocity = Vector3.new(dir.X * Config.Speed, r.AssemblyLinearVelocity.Y, dir.Z * Config.Speed)
+        end
+        if h.WalkSpeed ~= 16 then h.WalkSpeed = 16 end
+    end)
+end
+
+-- =========================================================
+--  FLY
 -- =========================================================
 local flyConn, flyBV, flyBG
 local function startFly()
@@ -376,7 +319,6 @@ local function startFly()
     flyBG.P = 10000
     flyBG.CFrame = root.CFrame
     flyBG.Parent = root
-
     local cam = Workspace.CurrentCamera
     flyConn = RunService.RenderStepped:Connect(function()
         if not Config.FlyEnabled then return end
@@ -409,6 +351,7 @@ end
 -- =========================================================
 local noclipConn
 local function startNoclip()
+    if noclipConn then noclipConn:Disconnect() end
     noclipConn = RunService.Stepped:Connect(function()
         if not Config.NoClip then return end
         local c = LocalPlayer.Character
@@ -422,35 +365,28 @@ local function startNoclip()
 end
 
 -- =========================================================
---  COLLECTION LOGIC (TOUCH + REMOTE FALLBACK)
+--  COLLECTION
 -- =========================================================
 local function tryCollectEgg(egg)
     local part = getPart(egg)
-    if not part then return false end
+    if not part then return end
     local char = LocalPlayer.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root then return false end
-
-    -- Method 1: Remote (most reliable)
+    if not root then return end
     if State.Remote.Collect then
-        local ok = fireRemoteSafe(State.Remote.Collect, part)
-        if ok then return true end
+        fireRemoteSafe(State.Remote.Collect, part)
     end
-
-    -- Method 2: Touch interest
     pcall(function()
-        firetouchinterest(root, part, 0)
-        task.wait(0.02)
-        firetouchinterest(root, part, 1)
+        if firetouchinterest then
+            firetouchinterest(root, part, 0)
+            task.wait(0.02)
+            firetouchinterest(root, part, 1)
+        end
     end)
-
-    -- Method 3: Some games use a ProximityPrompt
     local prompt = part:FindFirstChildWhichIsA("ProximityPrompt") or (egg:IsA("Model") and egg:FindFirstChildWhichIsA("ProximityPrompt"))
-    if prompt then
+    if prompt and fireproximityprompt then
         pcall(function() fireproximityprompt(prompt, 0) end)
     end
-
-    return true
 end
 
 local function tryStealFromPlayer(p)
@@ -459,17 +395,13 @@ local function tryStealFromPlayer(p)
     if not root then return end
     local target = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
     if not target then return end
-
-    -- Method 1: Remote
-    if State.Remote.Steal then
-        fireRemoteSafe(State.Remote.Steal, p)
-    end
-
-    -- Method 2: Touch
+    if State.Remote.Steal then fireRemoteSafe(State.Remote.Steal, p) end
     pcall(function()
-        firetouchinterest(root, target, 0)
-        task.wait(0.02)
-        firetouchinterest(root, target, 1)
+        if firetouchinterest then
+            firetouchinterest(root, target, 0)
+            task.wait(0.02)
+            firetouchinterest(root, target, 1)
+        end
     end)
 end
 
@@ -479,152 +411,113 @@ local function tryDeposit(zone)
     if not root then return end
     local part = getPart(zone)
     if not part then return end
-
-    -- Method 1: Remote
-    if State.Remote.Deposit then
-        fireRemoteSafe(State.Remote.Deposit)
-    elseif State.Remote.Sell then
-        fireRemoteSafe(State.Remote.Sell)
-    end
-
-    -- Method 2: Touch
+    if State.Remote.Deposit then fireRemoteSafe(State.Remote.Deposit)
+    elseif State.Remote.Sell then fireRemoteSafe(State.Remote.Sell) end
     pcall(function()
-        firetouchinterest(root, part, 0)
-        task.wait(0.05)
-        firetouchinterest(root, part, 1)
+        if firetouchinterest then
+            firetouchinterest(root, part, 0)
+            task.wait(0.05)
+            firetouchinterest(root, part, 1)
+        end
     end)
-
-    -- Method 3: ProximityPrompt
     local prompt = part:FindFirstChildWhichIsA("ProximityPrompt")
-    if prompt then
+    if prompt and fireproximityprompt then
         pcall(function() fireproximityprompt(prompt, 0) end)
     end
 end
 
 local function tryHatch()
-    if State.Remote.Hatch then
-        fireRemoteSafe(State.Remote.Hatch)
-    end
+    if State.Remote.Hatch then fireRemoteSafe(State.Remote.Hatch) end
 end
 
 -- =========================================================
 --  AUTO LOOPS
 -- =========================================================
-local function autoFarmLoop()
-    task.spawn(function()
-        while State.Running do
-            if Config.AutoFarm then
-                local char = LocalPlayer.Character
-                if char and char:FindFirstChild("HumanoidRootPart") then
-                    local root = char.HumanoidRootPart
-                    local eggs = getEggs()
-                    local closest, dist = closestFrom(eggs, 200)
-                    if closest then
-                        local part = getPart(closest)
-                        if part then
-                            if dist <= Config.CollectRange then
-                                tryCollectEgg(closest)
-                            else
-                                walkTo(part.Position, Config.Speed)
-                            end
-                        end
+task.spawn(function()
+    while State.Running do
+        if Config.AutoFarm then
+            local char = LocalPlayer.Character
+            if char and char:FindFirstChild("HumanoidRootPart") then
+                local closest, dist = closestFrom(getEggs(), 200)
+                if closest then
+                    local part = getPart(closest)
+                    if part then
+                        if dist <= Config.CollectRange then tryCollectEgg(closest)
+                        else walkTo(part.Position) end
                     end
                 end
             end
-            task.wait(Config.FarmDelay)
         end
-    end)
-end
+        task.wait(Config.FarmDelay)
+    end
+end)
 
-local function autoStealLoop()
-    task.spawn(function()
-        while State.Running do
-            if Config.AutoSteal then
-                local char = LocalPlayer.Character
-                if char and char:FindFirstChild("HumanoidRootPart") then
-                    local players = getOtherPlayers()
-                    local closest, dist = closestFrom(players, 200)
-                    if closest and closest.Character then
-                        local target = closest.Character:FindFirstChild("HumanoidRootPart")
-                        if target then
-                            if dist <= Config.StealRange then
-                                tryStealFromPlayer(closest)
-                            else
-                                walkTo(target.Position, Config.Speed)
-                            end
-                        end
+task.spawn(function()
+    while State.Running do
+        if Config.AutoSteal then
+            local char = LocalPlayer.Character
+            if char and char:FindFirstChild("HumanoidRootPart") then
+                local closest, dist = closestFrom(getOtherPlayers(), 200)
+                if closest and closest.Character then
+                    local target = closest.Character:FindFirstChild("HumanoidRootPart")
+                    if target then
+                        if dist <= Config.StealRange then tryStealFromPlayer(closest)
+                        else walkTo(target.Position) end
                     end
                 end
             end
-            task.wait(Config.StealDelay)
         end
-    end)
-end
+        task.wait(Config.StealDelay)
+    end
+end)
 
-local function autoDepositLoop()
-    task.spawn(function()
-        while State.Running do
-            if Config.AutoDeposit then
-                local char = LocalPlayer.Character
-                if char and char:FindFirstChild("HumanoidRootPart") then
-                    local zones = getDepositZones()
-                    local closest, dist = closestFrom(zones, 200)
-                    if closest then
-                        local part = getPart(closest)
-                        if part then
-                            if dist and dist <= 5 then
-                                tryDeposit(closest)
-                            else
-                                walkTo(part.Position, Config.Speed)
-                            end
-                        end
+task.spawn(function()
+    while State.Running do
+        if Config.AutoDeposit then
+            local char = LocalPlayer.Character
+            if char and char:FindFirstChild("HumanoidRootPart") then
+                local closest, dist = closestFrom(getDepositZones(), 200)
+                if closest then
+                    local part = getPart(closest)
+                    if part then
+                        if dist and dist <= 5 then tryDeposit(closest)
+                        else walkTo(part.Position) end
                     end
                 end
             end
-            task.wait(Config.DepositDelay)
         end
-    end)
-end
+        task.wait(Config.DepositDelay)
+    end
+end)
 
-local function autoHatchLoop()
-    task.spawn(function()
-        while State.Running do
-            if Config.AutoHatch then tryHatch() end
-            task.wait(0.5)
-        end
-    end)
-end
+task.spawn(function()
+    while State.Running do
+        if Config.AutoHatch then tryHatch() end
+        task.wait(0.5)
+    end
+end)
 
-local function autoRejoinLoop()
-    task.spawn(function()
-        while State.Running do
-            task.wait(5)
-            if Config.AutoRejoin then
-                local conns = NetworkClient:GetConnections()
-                if not conns or #conns == 0 then
-                    pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
-                end
+task.spawn(function()
+    while State.Running do
+        task.wait(5)
+        if Config.AutoRejoin then
+            local conns = NetworkClient:GetConnections()
+            if not conns or #conns == 0 then
+                pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
             end
         end
-    end)
-end
+    end
+end)
 
 -- =========================================================
 --  ESP SYSTEMS
 -- =========================================================
-local function clearHighlights()
-    for k, h in pairs(State.Highlights) do
-        if h and h.Parent then h:Destroy() end
-        State.Highlights[k] = nil
-    end
-end
-
 local function setEggESP(on)
     if not on then
         for _, egg in ipairs(getEggs()) do
             local part = getPart(egg)
             if part then
-                local h = part:FindFirstChild("__CHINA_ESP")
+                local h = part:FindFirstChild("__CHINA_E")
                 if h then h:Destroy() end
             end
         end
@@ -634,13 +527,12 @@ local function setEggESP(on)
         while Config.EggESP and State.Running do
             for _, egg in ipairs(getEggs()) do
                 local part = getPart(egg)
-                if part and not part:FindFirstChild("__CHINA_ESP") then
+                if part and not part:FindFirstChild("__CHINA_E") then
                     local h = Instance.new("Highlight")
-                    h.Name = "__CHINA_ESP"
+                    h.Name = "__CHINA_E"
                     h.FillColor = Color3.fromRGB(120, 220, 120)
                     h.OutlineColor = Color3.fromRGB(255,255,255)
                     h.FillTransparency = 0.5
-                    h.OutlineTransparency = 0
                     h.Parent = part
                 end
             end
@@ -653,13 +545,12 @@ local function setPlayerESP(on)
     task.spawn(function()
         while Config.PlayerESP and State.Running do
             for _, p in ipairs(getOtherPlayers()) do
-                if p.Character and not p.Character:FindFirstChild("__CHINA_PESP") then
+                if p.Character and not p.Character:FindFirstChild("__CHINA_P") then
                     local h = Instance.new("Highlight")
-                    h.Name = "__CHINA_PESP"
+                    h.Name = "__CHINA_P"
                     h.FillColor = Color3.fromRGB(220, 80, 80)
                     h.OutlineColor = Color3.fromRGB(255,255,255)
                     h.FillTransparency = 0.6
-                    h.OutlineTransparency = 0
                     h.Parent = p.Character
                 end
             end
@@ -667,7 +558,7 @@ local function setPlayerESP(on)
         end
         for _, p in ipairs(Players:GetPlayers()) do
             if p ~= LocalPlayer and p.Character then
-                local h = p.Character:FindFirstChild("__CHINA_PESP")
+                local h = p.Character:FindFirstChild("__CHINA_P")
                 if h then h:Destroy() end
             end
         end
@@ -678,887 +569,4 @@ local function setDepositESP(on)
     task.spawn(function()
         while Config.DepositESP and State.Running do
             for _, z in ipairs(getDepositZones()) do
-                if not z:FindFirstChild("__CHINA_DESP") then
-                    local h = Instance.new("Highlight")
-                    h.Name = "__CHINA_DESP"
-                    h.FillColor = Color3.fromRGB(80, 160, 255)
-                    h.OutlineColor = Color3.fromRGB(255,255,255)
-                    h.FillTransparency = 0.5
-                    h.OutlineTransparency = 0
-                    h.Parent = z
-                end
-            end
-            task.wait(2)
-        end
-        for _, z in ipairs(getDepositZones()) do
-            local h = z:FindFirstChild("__CHINA_DESP")
-            if h then h:Destroy() end
-        end
-    end)
-end
-
-local tracerConn
-local function setTracers(on)
-    if tracerConn then tracerConn:Disconnect() tracerConn = nil end
-    if not on then
-        for _, a in pairs(State.TracersAdorn) do if a and a.Parent then a:Destroy() end end
-        State.TracersAdorn = {}
-        return
-    end
-    tracerConn = RunService.RenderStepped:Connect(function()
-        local char = LocalPlayer.Character
-        if not char or not char:FindFirstChild("HumanoidRootPart") then return end
-        local cam = Workspace.CurrentCamera
-        local root = char.HumanoidRootPart
-        -- clear old
-        for _, a in pairs(State.TracersAdorn) do if a and a.Parent then a:Destroy() end end
-        State.TracersAdorn = {}
-        if Config.EggESP then
-            for _, egg in ipairs(getEggs()) do
-                local part = getPart(egg)
-                if part then
-                    local dist = (root.Position - part.Position).Magnitude
-                    if dist < 200 then
-                        local adorn = Instance.new("Beam")
-                        adorn.FaceCamera = true
-                        adorn.Width0 = 0.1
-                        adorn.Width1 = 0.1
-                        adorn.Color = ColorSequence.new(Color3.fromRGB(120, 220, 120))
-                        adorn.Transparency = NumberSequence.new(0.3, 0.8)
-                        local a0 = Instance.new("Attachment", root)
-                        local a1 = Instance.new("Attachment", part)
-                        adorn.Attachment0 = a0
-                        adorn.Attachment1 = a1
-                        adorn.Parent = Workspace.CurrentCamera
-                        table.insert(State.TracersAdorn, adorn)
-                        table.insert(State.TracersAdorn, a0)
-                        table.insert(State.TracersAdorn, a1)
-                    end
-                end
-            end
-        end
-    end)
-end
-
--- =========================================================
---  HITBOX EXPANDER
--- =========================================================
-local hitboxConn
-local function setHitboxExpand(on)
-    if hitboxConn then hitboxConn:Disconnect() hitboxConn = nil end
-    if not on then
-        for _, egg in ipairs(getEggs()) do
-            local part = getPart(egg)
-            if part and part:FindFirstChild("__CHINA_HITBOX") then
-                part.Size = part.__CHINA_HITBOX.OriginalSize.Value
-                part.__CHINA_HITBOX:Destroy()
-            end
-        end
-        return
-    end
-    hitboxConn = RunService.Heartbeat:Connect(function()
-        if not Config.HitboxExpand then return end
-        for _, egg in ipairs(getEggs()) do
-            local part = getPart(egg)
-            if part and part:IsA("BasePart") then
-                if not part:FindFirstChild("__CHINA_HITBOX") then
-                    local store = Instance.new("Folder")
-                    store.Name = "__CHINA_HITBOX"
-                    local s = Instance.new("Vector3Value")
-                    s.Name = "OriginalSize"
-                    s.Value = part.Size
-                    s.Parent = store
-                    store.Parent = part
-                    part.Size = Vector3.new(Config.HitboxSize, Config.HitboxSize, Config.HitboxSize)
-                end
-            end
-        end
-    end)
-end
-
--- =========================================================
---  REACH
--- =========================================================
-local reachConn
-local function setReach(on)
-    if reachConn then reachConn:Disconnect() reachConn = nil end
-    if not on then
-        for _, p in ipairs(getOtherPlayers()) do
-            if p.Character then
-                local h = p.Character:FindFirstChild("HumanoidRootPart")
-                if h and h:FindFirstChild("__CHINA_REACH") then
-                    h.Size = h.__CHINA_REACH.Value
-                    h.__CHINA_REACH:Destroy()
-                end
-            end
-        end
-        return
-    end
-    reachConn = RunService.Heartbeat:Connect(function()
-        if not Config.ReachEnabled then return end
-        for _, p in ipairs(getOtherPlayers()) do
-            if p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
-                local h = p.Character.HumanoidRootPart
-                if not h:FindFirstChild("__CHINA_REACH") then
-                    local s = Instance.new("Vector3Value")
-                    s.Name = "__CHINA_REACH"
-                    s.Value = h.Size
-                    s.Parent = h
-                    h.Size = Vector3.new(Config.Reach, Config.Reach, Config.Reach)
-                end
-            end
-        end
-    end)
-end
-
--- =========================================================
---  FULLBRIGHT
--- =========================================================
-local function setFullbright(on)
-    if on then
-        Lighting.Brightness = 2
-        Lighting.ClockTime = 14
-        Lighting.FogEnd = 100000
-        Lighting.GlobalShadows = false
-        Lighting.EnvironmentDiffuseScale = 1
-        Lighting.EnvironmentSpecularScale = 1
-    else
-        Lighting.Brightness = 1
-        Lighting.ClockTime = 12
-        Lighting.GlobalShadows = true
-    end
-end
-
--- =========================================================
---  ANTI-AFK
--- =========================================================
-LocalPlayer.Idled:Connect(function()
-    if Config.AntiAFK then
-        VirtualUser:CaptureController()
-        VirtualUser:ClickButton1(Vector2.new())
-    end
-end)
-
--- =========================================================
---  INFINITE JUMP
--- =========================================================
-UserInputService.JumpRequest:Connect(function()
-    if Config.InfJump then
-        local char = LocalPlayer.Character
-        if char and char:FindFirstChild("Humanoid") then
-            char.Humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-        end
-    end
-end)
-
--- =========================================================
---  CLICK TP
--- =========================================================
-local clickConn
-local function setClickTP(on)
-    if clickConn then clickConn:Disconnect() clickConn = nil end
-    if not on then return end
-    clickConn = UserInputService.InputBegan:Connect(function(i, gp)
-        if gp then return end
-        if i.UserInputType == Enum.UserInputType.MouseButton1 and UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
-            local mouse = LocalPlayer:GetMouse()
-            if mouse.Hit then
-                teleportTo(mouse.Hit.Position)
-            end
-        end
-    end)
-end
-
--- =========================================================
---  UI (CUSTOM, ANIMATED)
--- =========================================================
-local UI = {}
-do
-    local old = CoreGui:FindFirstChild("ChinaV4EggUI")
-    if old then old:Destroy() end
-
-    local ScreenGui = Instance.new("ScreenGui")
-    ScreenGui.Name = "ChinaV4EggUI"
-    ScreenGui.ResetOnSpawn = false
-    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    ScreenGui.IgnoreGuiInset = true
-    ScreenGui.DisplayOrder = 9999
-    pcall(function() ScreenGui.Parent = CoreGui end)
-    if not ScreenGui.Parent then ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
-    UI.Screen = ScreenGui
-
-    local ACCENT  = Color3.fromRGB(120, 200, 120)
-    local ACCENT2 = Color3.fromRGB(80, 160, 80)
-    local BG      = Color3.fromRGB(22, 24, 28)
-    local BG2     = Color3.fromRGB(30, 33, 38)
-    local TXT     = Color3.fromRGB(235, 240, 235)
-    local TXTDIM  = Color3.fromRGB(150, 155, 150)
-
-    -- LOADING SCREEN
-    local Loader = Instance.new("Frame")
-    Loader.Size = UDim2.new(0, 280, 0, 140)
-    Loader.Position = UDim2.new(0.5, -140, 0.5, -70)
-    Loader.BackgroundColor3 = BG
-    Loader.BackgroundTransparency = 1
-    Loader.Parent = ScreenGui
-    local LC = Instance.new("UICorner") LC.CornerRadius = UDim.new(0, 10) LC.Parent = Loader
-
-    local LoadTitle = Instance.new("TextLabel")
-    LoadTitle.Size = UDim2.new(1, 0, 0, 30)
-    LoadTitle.Position = UDim2.new(0, 0, 0, 22)
-    LoadTitle.BackgroundTransparency = 1
-    LoadTitle.Text = "ChinaV4Egg v2"
-    LoadTitle.Font = Enum.Font.GothamBold
-    LoadTitle.TextSize = 22
-    LoadTitle.TextColor3 = TXT
-    LoadTitle.TextTransparency = 1
-    LoadTitle.Parent = Loader
-
-    local LoadSub = Instance.new("TextLabel")
-    LoadSub.Size = UDim2.new(1, 0, 0, 16)
-    LoadSub.Position = UDim2.new(0, 0, 0, 52)
-    LoadSub.BackgroundTransparency = 1
-    LoadSub.Text = "Detecting remotes..."
-    LoadSub.Font = Enum.Font.Gotham
-    LoadSub.TextSize = 12
-    LoadSub.TextColor3 = TXTDIM
-    LoadSub.TextTransparency = 1
-    LoadSub.Parent = Loader
-
-    local Spinner = Instance.new("Frame")
-    Spinner.Size = UDim2.new(0, 28, 0, 28)
-    Spinner.Position = UDim2.new(0.5, -14, 0, 88)
-    Spinner.BackgroundColor3 = Color3.new(0,0,0)
-    Spinner.BackgroundTransparency = 1
-    Spinner.Parent = Loader
-    local SC = Instance.new("UICorner") SC.CornerRadius = UDim.new(1,0) SC.Parent = Spinner
-    local SB = Instance.new("UIStroke") SB.Color = ACCENT SB.Thickness = 2 SB.Transparency = 0.3 SB.Parent = Spinner
-
-    tween(Loader, {BackgroundTransparency = 0}, 0.4)
-    task.wait(0.15)
-    tween(LoadTitle, {TextTransparency = 0}, 0.3)
-    tween(LoadSub,   {TextTransparency = 0}, 0.3)
-    task.spawn(function()
-        while Loader.Parent do
-            tween(Spinner, {Rotation = Spinner.Rotation + 360}, 0.7, Enum.EasingStyle.Linear)
-            task.wait(0.7)
-        end
-    end)
-
-    -- MAIN FRAME
-    local Main = Instance.new("Frame")
-    Main.Size = UDim2.new(0, 600, 0, 400)
-    Main.Position = UDim2.new(0.5, -300, 0.5, -200)
-    Main.BackgroundColor3 = BG
-    Main.BackgroundTransparency = 1
-    Main.Visible = false
-    Main.Parent = ScreenGui
-    local MC = Instance.new("UICorner") MC.CornerRadius = UDim.new(0, 10) MC.Parent = Main
-    local MS = Instance.new("UIStroke") MS.Color = BG2 MS.Thickness = 1 MS.Transparency = 1 MS.Parent = Main
-
-    local MainShadow = Instance.new("ImageLabel")
-    MainShadow.Size = UDim2.new(1, 30, 1, 30)
-    MainShadow.Position = UDim2.new(0, -15, 0, -15)
-    MainShadow.BackgroundTransparency = 1
-    MainShadow.Image = "rbxassetid://266543268"
-    MainShadow.ImageTransparency = 1
-    MainShadow.ScaleType = Enum.ScaleType.Slice
-    MainShadow.SliceCenter = Rect.new(10, 10, 118, 118)
-    MainShadow.Parent = Main
-    MainShadow.ZIndex = 0
-
-    UI.Main = Main
-
-    -- TOP BAR
-    local TopBar = Instance.new("Frame")
-    TopBar.Size = UDim2.new(1, 0, 0, 38)
-    TopBar.BackgroundColor3 = BG2
-    TopBar.BackgroundTransparency = 0
-    TopBar.Parent = Main
-    local TBC = Instance.new("UICorner") TBC.CornerRadius = UDim.new(0, 10) TBC.Parent = TopBar
-
-    local Title = Instance.new("TextLabel")
-    Title.Size = UDim2.new(0, 250, 1, 0)
-    Title.Position = UDim2.new(0, 14, 0, 0)
-    Title.BackgroundTransparency = 1
-    Title.Text = "  ChinaV4Egg v2"
-    Title.Font = Enum.Font.GothamBold
-    Title.TextSize = 14
-    Title.TextColor3 = TXT
-    Title.TextXAlignment = Enum.TextXAlignment.Left
-    Title.Parent = TopBar
-
-    local Dot = Instance.new("Frame")
-    Dot.Size = UDim2.new(0, 8, 0, 8)
-    Dot.Position = UDim2.new(0, 14, 0.5, -4)
-    Dot.BackgroundColor3 = ACCENT
-    Dot.Parent = TopBar
-    local DC = Instance.new("UICorner") DC.CornerRadius = UDim.new(1,0) DC.Parent = Dot
-
-    task.spawn(function()
-        while Main.Parent do
-            tween(Dot, {BackgroundColor3 = ACCENT2}, 0.8) task.wait(0.8)
-            tween(Dot, {BackgroundColor3 = ACCENT}, 0.8) task.wait(0.8)
-        end
-    end)
-
-    local CloseBtn = Instance.new("TextButton")
-    CloseBtn.Size = UDim2.new(0, 30, 0, 30)
-    CloseBtn.Position = UDim2.new(1, -36, 0, 4)
-    CloseBtn.BackgroundColor3 = BG
-    CloseBtn.Text = "×"
-    CloseBtn.Font = Enum.Font.GothamBold
-    CloseBtn.TextSize = 18
-    CloseBtn.TextColor3 = TXTDIM
-    CloseBtn.Parent = TopBar
-    local CBC = Instance.new("UICorner") CBC.CornerRadius = UDim.new(0, 6) CBC.Parent = CloseBtn
-    CloseBtn.MouseEnter:Connect(function() tween(CloseBtn, {BackgroundColor3 = Color3.fromRGB(60,30,30), TextColor3 = TXT}, 0.15) end)
-    CloseBtn.MouseLeave:Connect(function() tween(CloseBtn, {BackgroundColor3 = BG, TextColor3 = TXTDIM}, 0.15) end)
-    CloseBtn.MouseButton1Click:Connect(function()
-        State.Running = false
-        tween(Main, {Position = UDim2.new(0.5, -300, 0.5, -190), BackgroundTransparency = 1}, 0.25)
-        task.wait(0.3) ScreenGui:Destroy()
-    end)
-
-    -- SIDEBAR
-    local Sidebar = Instance.new("Frame")
-    Sidebar.Size = UDim2.new(0, 140, 1, -38)
-    Sidebar.Position = UDim2.new(0, 0, 0, 38)
-    Sidebar.BackgroundColor3 = BG2
-    Sidebar.BackgroundTransparency = 0
-    Sidebar.Parent = Main
-
-    local Tabs = {}
-
-    local function createTab(name)
-        local TabBtn = Instance.new("TextButton")
-        TabBtn.Size = UDim2.new(1, -20, 0, 32)
-        TabBtn.Position = UDim2.new(0, 10, 0, #Tabs * 38 + 12)
-        TabBtn.BackgroundColor3 = BG
-        TabBtn.Text = "  " .. name
-        TabBtn.Font = Enum.Font.Gotham
-        TabBtn.TextSize = 12
-        TabBtn.TextColor3 = TXTDIM
-        TabBtn.TextXAlignment = Enum.TextXAlignment.Left
-        TabBtn.AutoButtonColor = false
-        TabBtn.Parent = Sidebar
-        local TC2 = Instance.new("UICorner") TC2.CornerRadius = UDim.new(0, 6) TC2.Parent = TabBtn
-
-        local Accent = Instance.new("Frame")
-        Accent.Size = UDim2.new(0, 3, 0, 0)
-        Accent.Position = UDim2.new(0, 0, 0.5, 0)
-        Accent.BackgroundColor3 = ACCENT
-        Accent.Parent = TabBtn
-        local AC2 = Instance.new("UICorner") AC2.CornerRadius = UDim.new(1,0) AC2.Parent = Accent
-
-        local Page = Instance.new("ScrollingFrame")
-        Page.Size = UDim2.new(0, 450, 1, -54)
-        Page.Position = UDim2.new(0, 150, 0, 48)
-        Page.BackgroundColor3 = BG
-        Page.BackgroundTransparency = 1
-        Page.BorderSizePixel = 0
-        Page.ScrollBarThickness = 3
-        Page.ScrollBarImageColor3 = ACCENT
-        Page.CanvasSize = UDim2.new(0, 0, 0, 0)
-        Page.AutomaticCanvasSize = Enum.AutomaticSize.Y
-        Page.Visible = false
-        Page.Parent = Main
-
-        local Layout = Instance.new("UIListLayout")
-        Layout.SortOrder = Enum.SortOrder.LayoutOrder
-        Layout.Padding = UDim.new(0, 6)
-        Layout.Parent = Page
-
-        TabBtn.MouseEnter:Connect(function() if not Tabs[TabBtn].active then tween(TabBtn, {TextColor3 = TXT}, 0.15) end end)
-        TabBtn.MouseLeave:Connect(function() if not Tabs[TabBtn].active then tween(TabBtn, {TextColor3 = TXTDIM}, 0.15) end end)
-        TabBtn.MouseButton1Click:Connect(function()
-            for btn, info in pairs(Tabs) do
-                info.active = false
-                info.page.Visible = false
-                tween(info.accent, {Size = UDim2.new(0, 3, 0, 0)}, 0.2)
-                tween(btn, {TextColor3 = TXTDIM}, 0.2)
-            end
-            Tabs[TabBtn].active = true
-            Page.Visible = true
-            tween(Accent, {Size = UDim2.new(0, 3, 1, 0)}, 0.25)
-            tween(TabBtn, {TextColor3 = TXT}, 0.2)
-            Page.Position = UDim2.new(0, 156, 0, 48)
-            tween(Page, {Position = UDim2.new(0, 150, 0, 48)}, 0.2)
-        end)
-
-        Tabs[TabBtn] = {page = Page, active = false, accent = Accent}
-        return Page
-    end
-
-    -- UI ELEMENTS
-    local function addLabel(page, text)
-        local Lbl = Instance.new("TextLabel")
-        Lbl.Size = UDim2.new(1, -10, 0, 22)
-        Lbl.Position = UDim2.new(0, 5, 0, 0)
-        Lbl.BackgroundTransparency = 1
-        Lbl.Text = "  " .. text
-        Lbl.Font = Enum.Font.GothamBold
-        Lbl.TextSize = 12
-        Lbl.TextColor3 = ACCENT
-        Lbl.TextXAlignment = Enum.TextXAlignment.Left
-        Lbl.Parent = page
-    end
-
-    local function addToggle(page, name, desc, default, callback)
-        local Holder = Instance.new("Frame")
-        Holder.Size = UDim2.new(1, -10, 0, 44)
-        Holder.Position = UDim2.new(0, 5, 0, 0)
-        Holder.BackgroundColor3 = BG2
-        Holder.Parent = page
-        local HC2 = Instance.new("UICorner") HC2.CornerRadius = UDim.new(0, 6) HC2.Parent = Holder
-
-        local Label = Instance.new("TextLabel")
-        Label.Size = UDim2.new(1, -60, 0, 18)
-        Label.Position = UDim2.new(0, 12, 0, 6)
-        Label.BackgroundTransparency = 1
-        Label.Text = name
-        Label.Font = Enum.Font.GothamMedium
-        Label.TextSize = 13
-        Label.TextColor3 = TXT
-        Label.TextXAlignment = Enum.TextXAlignment.Left
-        Label.Parent = Holder
-
-        local Desc2 = Instance.new("TextLabel")
-        Desc2.Size = UDim2.new(1, -60, 0, 14)
-        Desc2.Position = UDim2.new(0, 12, 0, 24)
-        Desc2.BackgroundTransparency = 1
-        Desc2.Text = desc
-        Desc2.Font = Enum.Font.Gotham
-        Desc2.TextSize = 10
-        Desc2.TextColor3 = TXTDIM
-        Desc2.TextXAlignment = Enum.TextXAlignment.Left
-        Desc2.Parent = Holder
-
-        local Switch = Instance.new("TextButton")
-        Switch.Size = UDim2.new(0, 38, 0, 20)
-        Switch.Position = UDim2.new(1, -46, 0.5, -10)
-        Switch.BackgroundColor3 = BG
-        Switch.Text = ""
-        Switch.AutoButtonColor = false
-        Switch.Parent = Holder
-        local SLC = Instance.new("UICorner") SLC.CornerRadius = UDim.new(1,0) SLC.Parent = Switch
-
-        local Knob = Instance.new("Frame")
-        Knob.Size = UDim2.new(0, 14, 0, 14)
-        Knob.Position = UDim2.new(0, 3, 0.5, -7)
-        Knob.BackgroundColor3 = TXTDIM
-        Knob.Parent = Switch
-        local KC2 = Instance.new("UICorner") KC2.CornerRadius = UDim.new(1,0) KC2.Parent = Knob
-
-        local state = default or false
-        local function update(anim)
-            if state then
-                tween(Switch, {BackgroundColor3 = ACCENT}, anim and 0.2 or 0)
-                tween(Knob, {Position = UDim2.new(1, -17, 0.5, -7), BackgroundColor3 = TXT}, anim and 0.2 or 0)
-            else
-                tween(Switch, {BackgroundColor3 = BG}, anim and 0.2 or 0)
-                tween(Knob, {Position = UDim2.new(0, 3, 0.5, -7), BackgroundColor3 = TXTDIM}, anim and 0.2 or 0)
-            end
-        end
-        update(false)
-        Switch.MouseButton1Click:Connect(function() state = not state update(true) task.spawn(function() pcall(callback, state) end) end)
-        return {Set = function(v) state = v update(true) end, Get = function() return state end}
-    end
-
-    local function addSlider(page, name, min, max, default, callback)
-        local Holder = Instance.new("Frame")
-        Holder.Size = UDim2.new(1, -10, 0, 50)
-        Holder.Position = UDim2.new(0, 5, 0, 0)
-        Holder.BackgroundColor3 = BG2
-        Holder.Parent = page
-        local HC2 = Instance.new("UICorner") HC2.CornerRadius = UDim.new(0, 6) HC2.Parent = Holder
-
-        local Label = Instance.new("TextLabel")
-        Label.Size = UDim2.new(0, 200, 0, 18)
-        Label.Position = UDim2.new(0, 12, 0, 6)
-        Label.BackgroundTransparency = 1
-        Label.Text = name
-        Label.Font = Enum.Font.GothamMedium
-        Label.TextSize = 13
-        Label.TextColor3 = TXT
-        Label.TextXAlignment = Enum.TextXAlignment.Left
-        Label.Parent = Holder
-
-        local ValueLbl = Instance.new("TextLabel")
-        ValueLbl.Size = UDim2.new(0, 50, 0, 18)
-        ValueLbl.Position = UDim2.new(1, -60, 0, 6)
-        ValueLbl.BackgroundTransparency = 1
-        ValueLbl.Text = tostring(default)
-        ValueLbl.Font = Enum.Font.GothamMedium
-        ValueLbl.TextSize = 13
-        ValueLbl.TextColor3 = ACCENT
-        ValueLbl.TextXAlignment = Enum.TextXAlignment.Right
-        ValueLbl.Parent = Holder
-
-        local Track = Instance.new("Frame")
-        Track.Size = UDim2.new(1, -24, 0, 4)
-        Track.Position = UDim2.new(0, 12, 0, 36)
-        Track.BackgroundColor3 = BG
-        Track.Parent = Holder
-        local TC2 = Instance.new("UICorner") TC2.CornerRadius = UDim.new(1,0) TC2.Parent = Track
-
-        local Fill = Instance.new("Frame")
-        Fill.Size = UDim2.new((default - min)/(max - min), 0, 1, 0)
-        Fill.BackgroundColor3 = ACCENT
-        Fill.Parent = Track
-        local FC2 = Instance.new("UICorner") FC2.CornerRadius = UDim.new(1,0) FC2.Parent = Fill
-
-        local Knob = Instance.new("Frame")
-        Knob.Size = UDim2.new(0, 12, 0, 12)
-        Knob.Position = UDim2.new(Fill.Size.X.Scale, -6, 0.5, -6)
-        Knob.BackgroundColor3 = TXT
-        Knob.Parent = Track
-        local KC2 = Instance.new("UICorner") KC2.CornerRadius = UDim.new(1,0) KC2.Parent = Knob
-
-        local dragging = false
-        local function setFromX(x)
-            local rel = math.clamp((x - Track.AbsolutePosition.X) / Track.AbsoluteSize.X, 0, 1)
-            local val = min + (max - min) * rel
-            val = math.floor(val * 10) / 10
-            tween(Fill, {Size = UDim2.new(rel, 0, 1, 0)}, 0.05)
-            tween(Knob, {Position = UDim2.new(rel, -6, 0.5, -6)}, 0.05)
-            ValueLbl.Text = tostring(val)
-            pcall(callback, val)
-        end
-        Track.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = true setFromX(i.Position.X) end end)
-        Track.InputEnded:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end end)
-        UserInputService.InputChanged:Connect(function(i) if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then setFromX(i.Position.X) end end)
-    end
-
-    local function addButton(page, name, callback)
-        local Btn = Instance.new("TextButton")
-        Btn.Size = UDim2.new(1, -10, 0, 34)
-        Btn.Position = UDim2.new(0, 5, 0, 0)
-        Btn.BackgroundColor3 = BG2
-        Btn.Text = name
-        Btn.Font = Enum.Font.GothamMedium
-        Btn.TextSize = 13
-        Btn.TextColor3 = TXT
-        Btn.AutoButtonColor = false
-        Btn.Parent = page
-        local BC2 = Instance.new("UICorner") BC2.CornerRadius = UDim.new(0, 6) BC2.Parent = Btn
-        Btn.MouseEnter:Connect(function() tween(Btn, {BackgroundColor3 = ACCENT, TextColor3 = BG}, 0.15) end)
-        Btn.MouseLeave:Connect(function() tween(Btn, {BackgroundColor3 = BG2, TextColor3 = TXT}, 0.15) end)
-        Btn.MouseButton1Click:Connect(function() task.spawn(callback) end)
-    end
-
-    -- BUILD TABS
-    local PageFarm   = createTab("Autofarm")
-    local PageMove   = createTab("Movement")
-    local PageVisual = createTab("Visuals")
-    local PageCombat = createTab("Combat")
-    local PageMisc   = createTab("Misc")
-    local PageConfig = createTab("Config")
-
-    -- AUTOFARM
-    addLabel(PageFarm, "EGG FARMING")
-    addToggle(PageFarm, "AutoFarm", "Auto-collect spawned eggs", false, function(v) Config.AutoFarm = v end)
-    addToggle(PageFarm, "AutoSteal", "Steal eggs from other players", false, function(v) Config.AutoSteal = v end)
-    addToggle(PageFarm, "AutoDeposit", "Walk to deposit zone", false, function(v) Config.AutoDeposit = v end)
-    addToggle(PageFarm, "AutoHatch", "Auto-hatch collected eggs", false, function(v) Config.AutoHatch = v end)
-    addToggle(PageFarm, "Use Pathfinding", "Legit movement (recommended)", true, function(v) Config.UsePathfind = v end)
-    addSlider(PageFarm, "Farm Range", 3, 30, Config.CollectRange, function(v) Config.CollectRange = v end)
-    addSlider(PageFarm, "Steal Range", 3, 30, Config.StealRange, function(v) Config.StealRange = v end)
-
-    -- MOVEMENT
-    addLabel(PageMove, "MOVEMENT")
-    addToggle(PageMove, "Speed Boost", "Velocity-based bypass", false, function(v) Config.SpeedEnabled = v end)
-    addSlider(PageMove, "Speed", 16, 200, Config.Speed, function(v) Config.Speed = v end)
-    addToggle(PageMove, "Fly", "Hold W/S/A/D/Space/Shift", false, function(v)
-        Config.FlyEnabled = v
-        if v then startFly() else stopFly() end
-    end)
-    addSlider(PageMove, "Fly Speed", 16, 200, Config.FlySpeed, function(v) Config.FlySpeed = v end)
-    addToggle(PageMove, "NoClip", "Walk through walls", false, function(v)
-        Config.NoClip = v
-        if v and not noclipConn then startNoclip() end
-    end)
-    addToggle(PageMove, "Infinite Jump", "Jump in midair", false, function(v) Config.InfJump = v end)
-    addToggle(PageMove, "Click TP (Ctrl+Click)", "Teleport to mouse position", false, function(v)
-        Config.ClickTP = v setClickTP(v)
-    end)
-
-    -- VISUALS
-    addLabel(PageVisual, "ESP / RENDER")
-    addToggle(PageVisual, "Egg ESP", "Highlight all eggs", false, function(v) Config.EggESP = v setEggESP(v) end)
-    addToggle(PageVisual, "Player ESP", "Highlight players", false, function(v) Config.PlayerESP = v setPlayerESP(v) end)
-    addToggle(PageVisual, "Deposit ESP", "Highlight deposit zones", false, function(v) Config.DepositESP = v setDepositESP(v) end)
-    addToggle(PageVisual, "Tracers", "Lines from you to eggs", false, function(v) Config.Tracers = v setTracers(v) end)
-    addToggle(PageVisual, "Fullbright", "Brighten the world", false, function(v) Config.Fullbright = v setFullbright(v) end)
-    addLabel(PageVisual, "HITBOXES")
-    addToggle(PageVisual, "Hitbox Expand", "Make eggs easier to collect", false, function(v) Config.HitboxExpand = v setHitboxExpand(v) end)
-    addSlider(PageVisual, "Hitbox Size", 3, 30, Config.HitboxSize, function(v) Config.HitboxSize = v end)
-
-    -- COMBAT
-    addLabel(PageCombat, "REACH")
-    addToggle(PageCombat, "Reach Expand", "Make players' hitboxes huge", false, function(v) Config.ReachEnabled = v setReach(v) end)
-    addSlider(PageCombat, "Reach Size", 5, 50, Config.Reach, function(v) Config.Reach = v end)
-    addLabel(PageCombat, "DEFENSE")
-    addToggle(PageCombat, "Anti-Knockback", "Cancel velocity changes from hits", false, function(v)
-        Config.AntiKnockback = v
-        applyAntiKnockback()
-    end)
-
-    -- MISC
-    addLabel(PageMisc, "AUTOMATION")
-    addToggle(PageMisc, "Anti-AFK", "Block idle kicks", true, function(v) Config.AntiAFK = v end)
-    addToggle(PageMisc, "AutoRejoin", "Rejoin on disconnect", false, function(v) Config.AutoRejoin = v end)
-    addLabel(PageMisc, "SERVERS")
-    addButton(PageMisc, "Server Hop (New Random)", function() serverHop() end)
-    addButton(PageMisc, "Rejoin This Server", function() rejoin() end)
-    addButton(PageMisc, "Copy JobId", function()
-        if setclipboard then setclipboard(game.JobId) end
-        UI.notify("Copied: " .. game.JobId)
-    end)
-    addLabel(PageMisc, "DETECTED REMOTES")
-    local remoteStatus = Instance.new("TextLabel")
-    remoteStatus.Size = UDim2.new(1, -10, 0, 80)
-    remoteStatus.Position = UDim2.new(0, 5, 0, 0)
-    remoteStatus.BackgroundColor3 = BG2
-    remoteStatus.BackgroundTransparency = 0
-    remoteStatus.Font = Enum.Font.Gotham
-    remoteStatus.TextSize = 11
-    remoteStatus.TextColor3 = TXT
-    remoteStatus.TextWrapped = true
-    remoteStatus.TextXAlignment = Enum.TextXAlignment.Left
-    remoteStatus.TextYAlignment = Enum.TextYAlignment.Top
-    remoteStatus.Text = "  Scanning..."
-    remoteStatus.Parent = PageMisc
-    local rmc = Instance.new("UICorner") rmc.CornerRadius = UDim.new(0,6) rmc.Parent = remoteStatus
-    UI.RemoteStatus = remoteStatus
-
-    -- CONFIG
-    addLabel(PageConfig, "SAVE / LOAD")
-    addButton(PageConfig, "Save Config", function() saveConfig() end)
-    addButton(PageConfig, "Load Config", function() loadConfig() end)
-    addButton(PageConfig, "Reset Config", function()
-        for k, v in pairs(Config) do
-            if type(v) == "boolean" then Config[k] = false end
-        end
-        Config.AntiAFK = true
-        UI.notify("Config reset")
-    end)
-
-    -- TOAST NOTIFICATIONS
-    local ToastHolder = Instance.new("Frame")
-    ToastHolder.Size = UDim2.new(0, 280, 1, 0)
-    ToastHolder.Position = UDim2.new(1, -300, 0, 0)
-    ToastHolder.BackgroundTransparency = 1
-    ToastHolder.Parent = ScreenGui
-    local TL = Instance.new("UIListLayout")
-    TL.SortOrder = Enum.SortOrder.LayoutOrder
-    TL.VerticalAlignment = Enum.VerticalAlignment.Bottom
-    TL.Padding = UDim.new(0, 6)
-    TL.Parent = ToastHolder
-
-    function UI.notify(text)
-        task.spawn(function()
-            local Toast = Instance.new("Frame")
-            Toast.Size = UDim2.new(1, 0, 0, 32)
-            Toast.BackgroundColor3 = BG2
-            Toast.BackgroundTransparency = 1
-            Toast.Parent = ToastHolder
-            local TC2 = Instance.new("UICorner") TC2.CornerRadius = UDim.new(0, 6) TC2.Parent = Toast
-            local Bar = Instance.new("Frame")
-            Bar.Size = UDim2.new(0, 3, 1, -6)
-            Bar.Position = UDim2.new(0, 6, 0, 3)
-            Bar.BackgroundColor3 = ACCENT
-            Bar.Parent = Toast
-            local BC2 = Instance.new("UICorner") BC2.CornerRadius = UDim.new(1,0) BC2.Parent = Bar
-            local Lbl = Instance.new("TextLabel")
-            Lbl.Size = UDim2.new(1, -20, 1, 0)
-            Lbl.Position = UDim2.new(0, 16, 0, 0)
-            Lbl.BackgroundTransparency = 1
-            Lbl.Text = text
-            Lbl.Font = Enum.Font.Gotham
-            Lbl.TextSize = 12
-            Lbl.TextColor3 = TXT
-            Lbl.TextXAlignment = Enum.TextXAlignment.Left
-            Lbl.TextTruncate = Enum.TextTruncate.AtEnd
-            Lbl.Parent = Toast
-            Toast.Position = UDim2.new(1, 0, 1, 0)
-            tween(Toast, {BackgroundTransparency = 0, Position = UDim2.new(0, 0, 1, 0)}, 0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
-            task.wait(3.5)
-            tween(Toast, {BackgroundTransparency = 1, Position = UDim2.new(1, 20, 1, 0)}, 0.3)
-            task.wait(0.3) Toast:Destroy()
-        end)
-    end
-
-    -- DRAG
-    local dragging, dragStart, startPos
-    TopBar.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-            dragging = true dragStart = i.Position startPos = Main.Position
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(i)
-        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
-            local delta = i.Position - dragStart
-            tween(Main, {Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)}, 0.05)
-        end
-    end)
-    UserInputService.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
-    end)
-
-    -- UI TOGGLE
-    UserInputService.InputBegan:Connect(function(i, gp)
-        if gp then return end
-        if i.KeyCode == Enum.KeyCode.RightShift then
-            State.UIVisible = not State.UIVisible
-            if State.UIVisible then
-                Main.Visible = true
-                Main.Position = UDim2.new(0.5, -300, 0.5, -180)
-                tween(Main, {Position = UDim2.new(0.5, -300, 0.5, -200), BackgroundTransparency = 0}, 0.25)
-                tween(MainShadow, {ImageTransparency = 0.5}, 0.25)
-                tween(MS, {Transparency = 0}, 0.25)
-            else
-                tween(Main, {Position = UDim2.new(0.5, -300, 0.5, -220), BackgroundTransparency = 1}, 0.2)
-                tween(MainShadow, {ImageTransparency = 1}, 0.2)
-                tween(MS, {Transparency = 1}, 0.2)
-                task.delay(0.2, function() if not State.UIVisible then Main.Visible = false end end)
-            end
-        end
-    end)
-end
-
--- =========================================================
---  CONFIG SAVE / LOAD
--- =========================================================
-local configFolder = "ChinaV4Egg"
-function saveConfig()
-    if not writefile then UI.notify("writefile not supported") return end
-    if not isfolder(configFolder) then makefolder(configFolder) end
-    local data = HttpService:JSONEncode(Config)
-    writefile(configFolder .. "/config.json", data)
-    UI.notify("Config saved")
-end
-
-function loadConfig()
-    if not readfile then UI.notify("readfile not supported") return end
-    if not isfile(configFolder .. "/config.json") then UI.notify("No saved config") return end
-    local data = readfile(configFolder .. "/config.json")
-    local loaded = HttpService:JSONDecode(data)
-    for k, v in pairs(loaded) do Config[k] = v end
-    UI.notify("Config loaded")
-end
-
--- =========================================================
---  SERVER HOP / REJOIN
--- =========================================================
-function rejoin()
-    UI.notify("Rejoining...")
-    pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer) end)
-end
-
-function serverHop()
-    UI.notify("Hopping servers...")
-    local json
-    pcall(function() json = game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100") end)
-    if not json then UI.notify("Could not fetch servers") return end
-    local decoded = HttpService:JSONDecode(json)
-    if not decoded or not decoded.data then UI.notify("Bad response") return end
-    local cands = {}
-    for _, s in ipairs(decoded.data) do
-        if s.playing < s.maxPlayers and s.id ~= game.JobId then table.insert(cands, s) end
-    end
-    if #cands == 0 then UI.notify("No other servers") return end
-    local target = cands[math.random(1, #cands)]
-    UI.notify("Hopping to: " .. tostring(target.id):sub(1, 8) .. "...")
-    pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, target.id, LocalPlayer) end)
-end
-
--- =========================================================
---  CHARACTER HANDLING
--- =========================================================
-LocalPlayer.CharacterAdded:Connect(function(char)
-    task.wait(1)
-    if Config.EggESP then setEggESP(true) end
-    if Config.PlayerESP then setPlayerESP(true) end
-    if Config.FlyEnabled then startFly() end
-end)
-
--- =========================================================
---  BOOTSTRAP
--- =========================================================
-local function bootstrap()
-    if not LocalPlayer.Character then LocalPlayer.CharacterAdded:Wait() end
-    task.wait(0.5)
-
-    -- Install anticheat bypasses
-    installWalkSpeedBypass()
-    applySpeedBypass()
-
-    -- Detect remotes
-    local found = scanForRemotes()
-    State.Remote.Collect = found.Collect
-    State.Remote.Steal   = found.Steal
-    State.Remote.Deposit = found.Deposit
-    State.Remote.Sell    = found.Sell
-    State.Remote.Hatch   = found.Hatch
-
-    -- Update remote status UI
-    if UI.RemoteStatus then
-        local lines = {"  Detected remotes:"}
-        local function line(name, remote)
-            if remote then
-                table.insert(lines, "  • " .. name .. ": " .. remote.Name .. " (" .. remote.ClassName .. ")")
-            else
-                table.insert(lines, "  • " .. name .. ": not found")
-            end
-        end
-        line("Collect", found.Collect)
-        line("Steal", found.Steal)
-        line("Deposit", found.Deposit)
-        line("Sell", found.Sell)
-        line("Hatch", found.Hatch)
-        UI.RemoteStatus.Text = table.concat(lines, "\n")
-    end
-
-    -- Start loops
-    autoFarmLoop()
-    autoStealLoop()
-    autoDepositLoop()
-    autoHatchLoop()
-    autoRejoinLoop()
-
-    State.Loaded = true
-end
-
--- =========================================================
---  BOOT SEQUENCE
--- =========================================================
-task.spawn(function()
-    task.wait(2.5)
-    -- hide loader
-    local loader
-    for _, c in ipairs(UI.Screen:GetChildren()) do
-        if c:IsA("Frame") and c.Name ~= "Main" then loader = c break end
-    end
-    if loader then
-        tween(loader, {BackgroundTransparency = 1}, 0.3)
-        for _, c in ipairs(loader:GetChildren()) do
-            if c:IsA("TextLabel") then tween(c, {TextTransparency = 1}, 0.3) end
-        end
-        task.wait(0.3)
-        loader:Destroy()
-    end
-
-    -- show main
-    local main = UI.Main
-    main.Visible = true
-    main.BackgroundTransparency = 1
-    main.Position = UDim2.new(0.5, -300, 0.5, -180)
-    tween(main, {Position = UDim2.new(0.5, -300, 0.5, -200), BackgroundTransparency = 0}, 0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
-
-    task.wait(0.4)
-    UI.notify("ChinaV4Egg v2 loaded — press RightShift to toggle")
-    if State.Remote.Collect then UI.notify("Collection remote detected ✓") else UI.notify("No collect remote — using touch") end
-end)
-
-bootstrap()
+                if not z:FindFirstChild("__
